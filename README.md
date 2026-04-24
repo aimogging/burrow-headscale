@@ -9,6 +9,7 @@ sockets for ICMP.
 - [Examples](#examples)
 - [Commands](#commands)
 - [How it works](#how-it-works)
+- [Library API](#library-api)
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
@@ -268,6 +269,61 @@ for build / embed recipes.
    connections yamux-multiplex back to the owning client, which
    originates the `forward_to` connection locally.
 
+## Library API
+
+Anything `burrow-client` does over the tailnet is also exposed as a
+library — if you want to build your own tool that rides DERP without
+wrapping the `burrow-client` binary, use
+[`burrow::client_session::ClientSession`]. One `ClientSession` owns
+the Headscale registration + DERP connection + per-peer `boringtun`
+machinery; individual flows are short-lived handles on top.
+
+```rust
+use std::time::Duration;
+use burrow::client_session::ClientSession;
+use url::Url;
+
+let session = ClientSession::connect(
+    Url::parse("https://headscale.example.com")?,
+    "hskey-auth-…",
+    Some("my-tool".into()),
+).await?;
+
+// Outbound TCP to a tailnet peer. Returns a tokio AsyncRead+AsyncWrite
+// (the DERP-backed DerpTcpStream) that acts like a real TcpStream.
+let mut stream = session.open_tcp("100.64.0.5".parse()?, 8080).await?;
+
+// One-shot UDP request / response (DNS-style).
+let answer = session.query_udp(
+    "100.64.0.5".parse()?,
+    53,
+    &dns_query_bytes,
+    Duration::from_secs(5),
+).await?;
+
+// Or long-lived UDP — bind_udp returns a drop-guarded receiver.
+let mut udp = session.bind_udp();
+session.send_udp(udp.port(), "100.64.0.5".parse()?, 1234, b"hi").await?;
+while let Some((src, port, payload)) = udp.recv().await { … }
+```
+
+`ClientSession` spawns background tasks (netmap reconciler, DERP
+supervisor, smoltcp runtime, WG timer tick, event dispatcher); they're
+all aborted when the session drops. Everything is `Send + Sync` so the
+session can be shared via `Arc` across tasks.
+
+Gotchas worth knowing:
+- **Build-time:** if Headscale uses a self-signed cert, set
+  `BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem` before running. Otherwise
+  the TLS handshake fails with `UnknownIssuer`.
+- **First connect is slow** (~3 s) while the WG handshake completes —
+  smoltcp retries the SYN once boringtun has a session.
+- **PTY interactive shell:** burrow uses ConPTY on Windows / forkpty
+  on Unix. On Windows a headless driver must answer cursor-position
+  DSR queries (`\x1b[6n`) or the shell will hang; see
+  `tests/burrow_client_headscale.rs::interactive_shell_runs_chained_commands_via_real_derp`
+  for a worked example.
+
 ## Limitations
 
 - **DERP-only transport.** No direct peer-to-peer; everything relays
@@ -287,20 +343,47 @@ for build / embed recipes.
 ## Development
 
 ```sh
-cargo test                                # hermetic lib + integration tests
+cargo test                                # hermetic lib + integration tests (~130 cases)
 cargo test --features insecure-tests      # plus real-DERP / real-Headscale tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-Real-infra tests are gated on:
+The hermetic suite (91 lib + 33 integration) covers the full data
+plane under an in-memory DERP stub — smoltcp, NAT, reverse-tunnel
+protocol, shell handler, DNS resolver, CBOR framing. It's stable
+enough to run on any commit.
 
-- `BURROW_TEST_DERP_URL` — opts `tests/derp_real_roundtrip.rs` in.
-- `BURROW_TEST_HEADSCALE_URL` + `BURROW_TEST_HEADSCALE_AUTHKEY` —
-  opts `tests/headscale_register_roundtrip.rs` +
-  `tests/burrow_client_headscale.rs` in.
+Real-infra tests — gated on feature + env vars, short-circuit
+cleanly without them:
 
-Without those env vars the tests short-circuit cleanly so the
-hermetic suite stays green.
+| Test file | Env | Covers |
+|---|---|---|
+| `tests/headscale_register_roundtrip.rs` | `BURROW_TEST_HEADSCALE_{URL,AUTHKEY}` | Noise IK register + netmap |
+| `tests/burrow_client_headscale.rs` | same | 7 full E2E workflows (see below) |
+| `tests/derp_real_roundtrip.rs` | `BURROW_TEST_DERP_URL`, `#[ignore]` | bare-derper transport only |
+
+`burrow_client_headscale.rs` is the real-infra flagship — 13 cases
+(7 tokio E2E + 6 helper unit) in ~45 s wall time against a live
+Headscale. It exercises:
+
+- the CBOR control plane through `ClientSession::open_tcp`,
+- `burrow-client tunnel start -R` for TCP + UDP reverse tunnels,
+- `burrow-client shell --output -` one-shot mode,
+- `ClientSession::query_udp` against burrow's built-in DNS resolver,
+- multi-peer routing (one session, two burrows),
+- the framed-stdio interactive-shell protocol driven directly.
+
+For a self-signed Headscale, set
+`BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem`. Example against a local
+Headscale-in-Docker reached via SSH forward:
+
+```sh
+ssh -fN -L 18443:localhost:8443 your-headscale-host
+BURROW_TEST_HEADSCALE_URL=https://localhost:18443 \
+BURROW_TEST_HEADSCALE_AUTHKEY=hskey-auth-… \
+BURROW_EXTRA_CA_BUNDLE=/etc/headscale/ca.pem \
+    cargo test --features insecure-tests
+```
 
 Vendored tailscale-rs sits under `vendor/tailscale-rs/`; pinned commit
 in `vendor/tailscale-rs/REVISION`. Don't let `cargo fmt --all` walk

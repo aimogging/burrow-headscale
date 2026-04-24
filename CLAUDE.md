@@ -127,11 +127,51 @@ Vendored tailscale-rs lives in `vendor/tailscale-rs/`; pinned commit in
 - **smoltcp on a dedicated thread**: smoltcp's API is pull-based, not
   async. It runs on its own OS thread and communicates with tokio tasks
   via channels.
+- **smoltcp event ordering — data before FIN**: `run_smoltcp_thread`
+  drains `TcpData` *before* emitting `TcpFinFromPeer` when a state
+  transition + buffered inbound bytes happen in the same poll cycle.
+  `DerpTcpStream` treats `PeerFin` as EOF, so emitting in the other
+  order drops the last CBOR frame written immediately before
+  `close_tcp`. See `src/runtime.rs::run_smoltcp_thread` + the comment
+  block around the `can_recv()` branch.
 - **Connection lifecycle via smoltcp socket state**: 60s grace window
   after CLOSED/TIME_WAIT, background sweeper. SYN-for-expiring entry
   replaces the slot.
 - **DERP-only transport**: direct peer-to-peer (Tailscale's disco /
   NAT-traversal magic) is explicitly out of scope. Everything relays.
+- **`ClientSession` polls the PeerTable, not the Headscale watch,
+  for peer readiness**: `wait_for_peer` races the reconciler task —
+  `watch::Receiver::changed()` can fire before the reconciler's
+  insert lands in the `DashMap`, and no later netmap update arrives
+  to re-wake the waiter. A 50 ms polling loop observes the insert
+  directly and is trivially small wall-time (Headscale typically
+  delivers peers within a few hundred ms of registration).
+- **`ClientSession` has a monotonic ephemeral-port allocator**: smoltcp
+  0.13 rejects port 0 on `connect()` with `Unaddressable`, despite
+  what the docs imply. The session hands out ports from the
+  RFC 6335 range (49152..=65535) for both outbound TCP connects and
+  UDP binds (`src/client_session.rs::alloc_ephemeral_port`).
+
+## ClientSession public API
+
+`src/client_session.rs` exposes the full tailnet-client surface for
+anything that wants to ride the DERP transport without wrapping the
+`burrow-client` binary. Burrow-client itself is a thin shell around
+this module.
+
+- `ClientSession::connect(url, authkey, hostname)` — register + bring
+  up the data plane. Returns once tailnet IP + DERP region are known.
+- `ClientSession::open_tcp(dst, port) -> DerpTcpStream` — outbound
+  TCP, AsyncRead + AsyncWrite.
+- `ClientSession::bind_udp() -> UdpReceiver` — bind an ephemeral
+  port for UDP. Drop to release.
+- `ClientSession::send_udp(src_port, dst, dst_port, payload)` — raw
+  UDP send; pairs with `bind_udp`.
+- `ClientSession::query_udp(dst, port, payload, timeout) -> Vec<u8>`
+  — one-shot request-reply convenience (DNS etc).
+
+Ingress routes UDP datagrams for bound ephemeral ports to the
+matching `UdpReceiver`; everything else falls through to smoltcp.
 
 ## Workflow rules
 
@@ -167,24 +207,62 @@ Vendored tailscale-rs lives in `vendor/tailscale-rs/`; pinned commit in
   real-Headscale integration tests, which forward
   `ts_transport_derp/insecure-for-tests` and
   `ts_control/insecure-keyfetch` so a loopback tunnel with a
-  self-signed cert or plain HTTP works.
-- Integration tests that need infra:
-  - `tests/derp_real_roundtrip.rs` → needs `BURROW_TEST_DERP_URL`.
+  self-signed cert or plain HTTP works. For production-signed certs
+  use `BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem` instead — that keeps
+  verification on.
+- Integration tests that need infra (all short-circuit cleanly
+  without their env vars so the hermetic suite stays green):
   - `tests/headscale_register_roundtrip.rs` → needs
     `BURROW_TEST_HEADSCALE_URL` + `BURROW_TEST_HEADSCALE_AUTHKEY`.
-  Both short-circuit cleanly without those vars so the suite stays
-  hermetic.
+    Covers register + netmap stream against live Headscale.
+  - `tests/burrow_client_headscale.rs` → same env, 7 full-workflow
+    E2E cases (CBOR smoke, TCP reverse tunnel, UDP reverse tunnel,
+    shell one-shot, DNS query, multi-peer routing, interactive-shell
+    framed stdio). Total ~45 s serial wall time.
+  - `tests/derp_real_roundtrip.rs` → `#[ignore]`d; needs
+    `BURROW_TEST_DERP_URL` pointing at a **bare** derper. Headscale's
+    embedded DERP validates node keys, which the test doesn't
+    register, so it fails there. Superseded by
+    `burrow_client_headscale.rs` for real-transport coverage.
+
+## Subprocess-driven E2E harness notes
+
+`tests/burrow_client_headscale.rs` spawns `burrow` and sometimes
+`burrow-client` as tokio subprocesses to exercise the real binaries.
+A few Windows/PTY gotchas that took debugging:
+
+- **Tracing goes to stdout, not stderr.** `tracing_subscriber::fmt()`
+  writes to stdout by default. The subprocess harness pipes both
+  streams and parses stdout for the `registered with Headscale
+  tailnet_ip=…` line.
+- **`NO_COLOR=1` on subprocess env.** Without it, tracing wraps
+  field names in ANSI escapes (`\x1b[3mtailnet_ip\x1b[0m=…`) that
+  defeat `line.find("tailnet_ip=")`.
+- **burrow-client initialises tracing to stderr** (`init_tracing` in
+  `src/bin/burrow-client.rs`). Separate stream from its stdout so
+  `shell --output -` stdout capture doesn't get log spam mixed in.
+- **ConPTY cursor-position DSR.** On Windows, when `burrow` spawns
+  a PTY via the ConPTY backend, the PTY probes its client with
+  `\x1b[6n` and may hang if not answered. The interactive-shell test
+  scans STDOUT frames for this sequence and replies with a canned
+  `\x1b[24;80R`.
+- **`tokio::process::Command::kill_on_drop(true)`** — always. tokio
+  doesn't kill children on task cancellation by default; without
+  this, a panicking test leaks burrow processes that stay registered
+  as Headscale nodes until Headscale's ephemeral expiry fires.
 
 Binary entry points:
 - `src/main.rs` — the gateway. Always goes through `hs_main::run`.
   Needs `--server-url`/`--authkey`/`--hostname` (or matching
   `BURROW_HEADSCALE_*` env, or a build-time embed via
   `--features embedded-headscale-config`).
-- `src/bin/burrow-client.rs` — companion CLI. Same top-level
-  credentials flags (propagated with `global = true`). When set,
-  `tunnel` / `shell` route through `burrow::client_session::ClientSession`
-  (DERP transport); when unset, they fall back to direct TCP — useful
-  for the in-process mock-server tests in `tests/burrow_client_cli.rs`.
+- `src/bin/burrow-client.rs` — companion CLI. Thin wrapper around
+  `burrow::client_session::ClientSession`. Same top-level credentials
+  flags propagated with `clap(global = true)`. When set, `tunnel` /
+  `shell` route through DERP; when unset they fall back to direct
+  TCP — useful for the in-process mock-server tests in
+  `tests/burrow_client_cli.rs`. `login` and `headscale-embed` always
+  need credentials (they're the credentials-consuming subcommands).
 
 `burrow-client` subcommands: `tunnel`, `shell`, `login` (register +
 print tailnet IP, for scripts), `headscale-embed` (write the 2- or
