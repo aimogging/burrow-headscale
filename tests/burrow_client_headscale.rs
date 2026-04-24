@@ -47,7 +47,7 @@ use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use burrow::client_session::ClientSession;
-use burrow::config::DEFAULT_CONTROL_PORT;
+use burrow::control::DEFAULT_CONTROL_PORT;
 use burrow::wire::{read_frame, write_frame, ClientReq, ServerResp};
 
 fn env() -> Option<(String, String)> {

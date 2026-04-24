@@ -1,6 +1,8 @@
-# burrow
+# burrow (headscale fork)
 
-Userspace WireGuard gateway. No TUN, no kernel drivers, no admin.
+Userspace WireGuard gateway that joins a Tailscale-compatible tailnet
+via Headscale + DERP. No TUN, no kernel drivers, no admin beyond raw
+sockets for ICMP.
 
 - [TL;DR](#tldr)
 - [Quick start](#quick-start)
@@ -13,185 +15,156 @@ Userspace WireGuard gateway. No TUN, no kernel drivers, no admin.
 
 ## TL;DR
 
-burrow is a WireGuard peer you drop inside a private network. It acts
-as a transparent MASQUERADE for other peers reaching internal hosts,
-and adds SSH `-R`-style reverse tunnels (bound on real OS listeners),
-a DNS resolver, and a remote shell over one control channel.
+`burrow` is a WireGuard peer you drop inside a private network. It
+registers as a node on a Headscale tailnet, gets a `100.x.y.z` IPv4,
+and exposes:
 
-Built on [boringtun](https://github.com/cloudflare/boringtun) and
-[smoltcp](https://github.com/smoltcp-rs/smoltcp).
+- transparent MASQUERADE for other tailnet peers reaching internal
+  LAN hosts,
+- SSH `-R`-style reverse tunnels bound on real OS listeners,
+- a DNS resolver, and
+- a remote shell,
 
-Three-party setup: a publicly-reachable WG server in the middle, a
-burrow gateway sitting inside some private network, and any number of
-WG peers (your laptop, a VPS, whatever). burrow bridges the WG side to
-the private LAN.
+all over a single CBOR control channel on `<tailnet_ip>:57821`.
+
+Built on [boringtun](https://github.com/cloudflare/boringtun),
+[smoltcp](https://github.com/smoltcp-rs/smoltcp), and the vendored
+[tailscale-rs](https://github.com/tailscale/tailscale-rs) (DERP +
+Noise IK + netmap).
+
+Topology:
 
 ```mermaid
 flowchart LR
-    subgraph peers ["WG peers<br/>(anywhere)"]
-        laptop[laptop]
-        vps[VPS]
-    end
-    subgraph pub ["Public internet"]
-        wgs["WG Server<br/>(kernel wireguard)"]
-    end
-    subgraph priv ["Private network<br/>(NAT'd, no inbound)"]
-        burrow["burrow<br/>userspace gateway"]
-        h1[internal host]
-        h2[internal host]
-    end
-    laptop <-->|WireGuard| wgs
-    vps <-->|WireGuard| wgs
-    wgs <-->|WireGuard| burrow
+    peer["tailnet peer<br/>(laptop, VPS,<br/>burrow-client, …)"]
+    derp[DERP relay]
+    hs[Headscale<br/>coordination]
+    burrow["burrow<br/>userspace gateway"]
+    h1[internal host]
+    h2[internal host]
+
+    peer <-->|DERP| derp
+    derp <-->|DERP| burrow
     burrow --- h1
     burrow --- h2
+    peer <-->|HTTPS + Noise IK| hs
+    burrow <-->|HTTPS + Noise IK| hs
 ```
 
-Reverse tunnels flip the direction. Any machine on burrow's network
-(WG peer, LAN host, the public internet if burrow is reachable there)
-hits a real OS listener on the burrow host; the connection rides back
-to whichever client called `tunnel start` and is originated locally.
+Coordination (who's who, what IP, which DERP region) is Headscale.
+Transport (encrypted WG datagrams between peers) is DERP. There's no
+direct P2P — Tailscale's disco / NAT-traversal magic is out of scope
+here; everything relays.
 
-```mermaid
-flowchart LR
-    caller([anyone with network<br/>access to burrow]) -->|plain TCP/UDP| listener["burrow:LISTEN_PORT"]
-    listener -.->|through the WG mesh| client["burrow-client<br/>(holding the tunnel open)"]
-    client -->|plain TCP/UDP| dst([forward_to])
-```
+Node identity is regenerated at every process start; nothing persists
+to disk. Headscale's `ephemeral=true` registration means stale nodes
+age out automatically.
 
 ## Quick start
 
+You need a reachable Headscale server and a preauth key. If you don't
+have one:
+
 ```sh
-# 1. Build binaries + generate configs. Embeds burrow.conf into the
-#    gateway binary so it runs with no config args. Artifacts:
-#      target/min/burrow(.exe)         -- gateway, config embedded
-#      target/min/burrow-client(.exe)  -- companion CLI
-#      burrow-configs/{server,burrow,client1}.conf
-just gen-embed --endpoint vpn.example.com:51820 --routes 192.168.1.0/24
-
-# 2. Transfer the gateway binary to the host that will sit inside your
-#    private network. It has the config baked in; no args needed.
-#    Linux gateway:
-scp target/min/burrow gateway-host:
-ssh gateway-host ./burrow
-#    Windows gateway, over SMB using the built-in C$ admin share
-#    (from PowerShell on this box; works if you have admin creds on
-#    the target — `net use` prompts if not cached):
-Copy-Item target\min\burrow.exe \\gateway-host\c$\Users\Administrator\
-# then RDP / `Enter-PSSession gateway-host` and run `.\burrow.exe`.
-# (Or enable the optional OpenSSH Server on the Windows host and
-# use `scp target/min/burrow.exe gateway-host:` like Linux.)
-
-# 3. Bring up the WG server on the public VPS (uses server.conf).
-just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
-
-# 4. Bring up the WG client here + drop into the tunnel's netns.
-just deploy-client
-just netns-shell
-# (inside the netns: anything you curl / dig / ssh to the exposed
-#  subnets reaches through burrow.)
+headscale users create test
+headscale preauthkeys create --user test --reusable
+# -> hskey-auth-<opaque-string>
 ```
 
-Three machines:
-- **WG server** (step 3): public VPS running kernel WireGuard.
-- **burrow host** (step 2): gateway sitting inside the private network.
-- **Client** (step 4): this box, running in an isolated netns so the
-  tunnel doesn't touch host routing.
+Three deployment modes for `burrow`:
 
-### `--routes`: split tunnel vs full tunnel
-
-`--routes` controls which destinations get directed through burrow.
-Two modes:
-
-- **Split tunnel** (typical): one or more specific CIDRs. Only traffic
-  destined for those ranges rides the tunnel; everything else uses
-  the client's normal network.
-
-  ```sh
-  just gen-embed --endpoint vpn.example.com:51820 \
-      --routes 192.168.1.0/24,10.50.0.0/24
-  ```
-
-- **Full tunnel**: `0.0.0.0/0`. All client traffic goes through the WG
-  server, through burrow, and out burrow's LAN uplink — burrow
-  becomes a self-hosted VPN egress. MASQUERADE is implicit (it's
-  already how burrow handles outbound). Pair with `--dns` so DNS has
-  a reachable resolver through the tunnel:
-
-  ```sh
-  just gen-embed --endpoint vpn.example.com:51820 \
-      --routes 0.0.0.0/0 --dns 10.0.0.2
-  ```
-
-  Throughput is bounded by burrow's LAN pipe; fine for a handful of
-  peers, not a commercial-grade VPN service.
-
-Teardown mirrors deploy:
+### 1. Ad-hoc CLI
 
 ```sh
-just deploy-server --target root@vpn.example.com --teardown
-just deploy-client --teardown
+cargo build --release
+./target/release/burrow \
+    --server-url https://headscale.example.com \
+    --authkey hskey-auth-...
+```
+
+### 2. Environment-based
+
+```sh
+export BURROW_HEADSCALE_URL=https://headscale.example.com
+export BURROW_HEADSCALE_AUTHKEY=hskey-auth-...
+export BURROW_HEADSCALE_HOSTNAME=gateway-a   # optional
+./target/release/burrow
+```
+
+### 3. Baked into the binary (`just embed`)
+
+For single-binary deploys. Credentials land in the binary's read-only
+data segment — treat the output with the same care as the preauth key.
+
+```sh
+# Write a 2- or 3-line embed file
+burrow-client headscale-embed \
+    --server-url https://headscale.example.com \
+    --authkey hskey-auth-... \
+    --hostname gateway-a \
+    --out ./burrow-headscale.txt
+
+# Build min-profile (opt-level=z, LTO, panic=abort) silent binary
+just embed ./burrow-headscale.txt
+# -> target/min/burrow(.exe), target/min/burrow-client(.exe)
+
+# Or do both in one step
+just gen-embed --server-url https://headscale.example.com \
+    --authkey hskey-auth-... --hostname gateway-a
+```
+
+Once `burrow` is up, check that it registered:
+
+```sh
+headscale nodes list
+# should show the gateway hostname with a 100.x.y.z address
 ```
 
 ## Examples
 
-All of these run from inside the client netns (`just netns-shell`) so
-traffic uses the tunnel. `10.0.0.2` is the burrow host's WG address in
-the examples — adjust for your subnet.
+`burrow-client` connects to `burrow` by tailnet IP (from `headscale
+nodes list`). Two ways to get the client onto the tailnet:
 
-### Reach an internal host
-
-Plain clients over the tunnel. Nothing burrow-client-specific:
+**Direct-TCP mode** (when the client's OS already has a route — e.g.
+another tailscale daemon is running on the same box):
 
 ```sh
-curl http://192.168.1.10/
-ssh user@192.168.1.50
-psql -h 192.168.1.20 -U postgres
+burrow-client tunnel 100.64.0.5 start -R 443:127.0.0.1:8080
 ```
 
-### DNS
-
-burrow answers A queries on `wg_ip:53` using the burrow host's system
-resolver (on by default; `DnsEnabled = true` in `burrow.conf`):
+**Embedded DERP mode** (no existing tailnet — burrow-client registers
+its own ephemeral node and rides DERP in-process):
 
 ```sh
-dig @10.0.0.2 internal.corp.lan
+export BURROW_HEADSCALE_URL=https://headscale.example.com
+export BURROW_HEADSCALE_AUTHKEY=hskey-auth-...
+burrow-client tunnel 100.64.0.5 start -R 443:127.0.0.1:8080
 ```
 
-Pass `--dns 10.0.0.2` to `burrow-client gen` to have the generated
-client.conf set `DNS = 10.0.0.2`, so wg-quick points every tool's
-resolver at burrow automatically while the tunnel is up.
+All subcommands take the same top-level `--server-url`/`--authkey`/
+`--hostname` flags; when set, they route through DERP instead of direct
+TCP. `BURROW_HEADSCALE_*` env vars work identically.
 
 ### Reverse tunnel — expose a local service
 
-SSH `-R`, but over WG. The burrow host binds a real OS listener;
-connections tunnel back here and originate on `forward_to` locally.
+SSH `-R`, but over the tailnet. The burrow host binds a real OS
+listener; connections tunnel back to the client and originate on
+`forward_to` locally.
 
 ```sh
-# Anything that connects to burrow_host:443 lands on 127.0.0.1:8080.
-burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
-# Hold Ctrl-C to stop — burrow-client holds the control flow open
-# for the tunnel's lifetime.
+# Anything that connects to <burrow_lan_ip>:443 lands on 127.0.0.1:8080
+burrow-client tunnel 100.64.0.5 start -R 443:127.0.0.1:8080
+# Ctrl-C to stop — burrow-client holds the control flow open for the
+# tunnel's lifetime.
 ```
 
-`HOST` can be a hostname — resolved on the machine running
-`burrow-client` when a connection arrives, using whatever DNS
-the client's system has configured. That includes burrow's built-in
-resolver if `client.conf` set `DNS = 10.0.0.2` (pass `--dns` to
-`burrow-client gen`); otherwise it uses the client's system resolver
-/ `/etc/resolv.conf`.
+`HOST` can be a hostname (resolved on the client when a connection
+arrives). `-R [BIND:]LISTEN:HOST:PORT`; BIND defaults to `0.0.0.0`. `-U`
+for UDP. Stop by id:
 
 ```sh
-burrow-client tunnel 10.0.0.2 start -R 443:db.internal.example.com:5432
-```
-
-`-R [BIND:]LISTEN:HOST:PORT` — BIND defaults to `0.0.0.0` (all OS
-interfaces on the burrow host). Pin to one interface with
-`-R 192.168.1.50:443:127.0.0.1:8080`. `-U` for UDP. Stop by id:
-
-```sh
-burrow-client tunnel 10.0.0.2 list
-burrow-client tunnel 10.0.0.2 stop 42
+burrow-client tunnel 100.64.0.5 list
+burrow-client tunnel 100.64.0.5 stop 42
 ```
 
 ### Shell — interactive
@@ -199,7 +172,7 @@ burrow-client tunnel 10.0.0.2 stop 42
 PTY session on the burrow host (default mode):
 
 ```sh
-burrow-client shell 10.0.0.2
+burrow-client shell 100.64.0.5
 # drops into cmd.exe on Windows, $SHELL / /bin/sh on Unix
 ```
 
@@ -208,21 +181,21 @@ burrow-client shell 10.0.0.2
 Run a command, capture stdout + stderr + exit code, return:
 
 ```sh
-# `--output -` pipes captured output to the local terminal:
-burrow-client shell 10.0.0.2 --output - --program whoami
+# --output - pipes captured output to the local terminal
+burrow-client shell 100.64.0.5 --output - --program whoami
 
-# `--output <path>` writes it to a file (stderr still goes to terminal):
-burrow-client shell 10.0.0.2 --output build.log --program make
+# --output <path> writes it to a file (stderr still on terminal)
+burrow-client shell 100.64.0.5 --output build.log --program make
 ```
 
 ### Shell — fire-and-forget
 
-Spawn detached; the server returns the pid and the process outlives
-the `burrow-client` invocation. Nothing is captured.
+Spawn detached; the server returns the pid and the process outlives the
+`burrow-client` invocation. Nothing is captured.
 
 ```sh
-burrow-client shell 10.0.0.2 --detach --program ./long-running-task
-# 47412        <- pid printed to local stdout
+burrow-client shell 100.64.0.5 --detach --program ./long-running-task
+# 47412    <- pid printed to local stdout
 ```
 
 ### Shell — custom program + argv
@@ -230,67 +203,109 @@ burrow-client shell 10.0.0.2 --detach --program ./long-running-task
 `--program` picks the executable; anything after `--` is argv:
 
 ```sh
-burrow-client shell 10.0.0.2 --program /usr/bin/python3 -- -i
-burrow-client shell 10.0.0.2 --program cmd.exe -- /c "dir C:\"
+burrow-client shell 100.64.0.5 --program /usr/bin/python3 -- -i
+burrow-client shell 100.64.0.5 --program cmd.exe -- /c "dir C:\"
 ```
+
+### Login — print the assigned tailnet IP
+
+```sh
+burrow-client login \
+    --server-url https://headscale.example.com \
+    --authkey hskey-auth-...
+# 100.64.0.7
+```
+
+Registers as an ephemeral node, waits for Headscale to assign an IPv4,
+prints it, and exits. Useful for scripts that need to announce a
+tailnet IP before spinning up a persistent session elsewhere.
 
 ## Commands
 
 ```
-burrow [--config <PATH>]                    # the gateway
-burrow-client tunnel <wg_ip> start -R ...   # reverse tunnels (TCP; -U for UDP)
-burrow-client shell  <wg_ip>                # interactive PTY on the burrow host
-burrow-client keygen                        # base64 x25519 keypair
-burrow-client gen ...                       # write server/burrow/client configs
+burrow [--server-url URL] [--authkey KEY] [--hostname NAME]
+    # the gateway; same flags available via BURROW_HEADSCALE_{URL,AUTHKEY,HOSTNAME}
+    # or baked in at build time with --features embedded-headscale-config.
+
+burrow-client [--server-url URL] [--authkey KEY] [--hostname NAME] \
+    tunnel <burrow_ip> start -R ...           # reverse tunnel (TCP; -U for UDP)
+burrow-client ... shell   <burrow_ip>         # interactive PTY on burrow
+burrow-client login  --server-url ... --authkey ...      # register, print IP
+burrow-client headscale-embed --server-url ... --authkey ... --out FILE
 ```
 
 `--help` on any subcommand for the full option surface. `just --list`
-for build / deploy recipes.
+for build / embed recipes.
 
 ## How it works
 
-1. boringtun decrypts inbound WG datagrams to raw IPv4.
-2. burrow's NAT table records the original destination and rewrites it
-   to smoltcp's virtual IP + per-flow gateway port. smoltcp is a
-   userspace TCP/IP stack; no TUN, no OS-level interfaces.
-3. For TCP, burrow dials the original destination as a real OS
-   `TcpStream` first — only on success does smoltcp answer the peer's
-   SYN. Closed ports get an RST, not a false SYN-ACK.
-4. UDP bypasses smoltcp: per-flow `UdpSocket`, idle-swept after 30s.
-5. Reverse tunnels bind real OS listeners on the gateway. Incoming
-   connections are yamux-multiplexed back to the owning client, which
-   originates the `forward_to` connection locally.
+```
+[DERP WebSocket] ←→ peer_table (boringtun Tunn per NodePublicKey)
+                         ↕ plaintext IPv4
+                 [destination rewrite shim]
+                         ↕
+                 smoltcp Interface
+                         ↕ TCP/UDP sockets
+                 [NAT table → real OS sockets]
+                         ↕
+                   LAN hosts
+```
 
-On the WG server: standard `AllowedIPs` routing, `ip_forward = 1`. No
-custom daemon.
+1. The Headscale client (vendored `ts_control`) handles registration +
+   netmap long-polling. Each delta feeds a `PeerTable` reconciler that
+   keeps one `boringtun::Tunn` per tailnet peer.
+2. Inbound: DERP WebSocket frames → look up sender's `Tunn` →
+   decapsulate → plaintext IPv4 → smoltcp.
+3. smoltcp only processes packets whose `dst` is its interface
+   address, so we rewrite `dst` to a synthetic `198.18.0.0/15` range on
+   ingress and restore it on egress. The NAT table holds the original
+   5-tuple so both directions resolve.
+4. For TCP, burrow dials the original destination as a real OS
+   `TcpStream` first — only on success does smoltcp answer the peer's
+   SYN. Closed ports get an RST; unreachable destinations get an ICMP.
+5. UDP bypasses smoltcp: per-flow `UdpSocket`, idle-swept after 30s.
+6. Reverse tunnels bind real OS listeners on burrow's host. Incoming
+   connections yamux-multiplex back to the owning client, which
+   originates the `forward_to` connection locally.
 
 ## Limitations
 
-- IPv4 only. No IPv6.
-- A burrow instance holds a single WG identity and talks to one
-  server endpoint — the parser rejects a second `[Peer]` and the
-  runtime only drives one. If you need more, run multiple burrow
-  instances with distinct configs (their own keys, wg_ips, control
-  ports). They can all peer with the same WG server (it's just more
-  `[Peer]` entries server-side) or with different ones — burrow
-  doesn't care.
-- ICMP without raw sockets returns admin-prohibited rather than
+- **DERP-only transport.** No direct peer-to-peer; everything relays
+  through a DERP server. Tailscale's disco protocol (endpoint discovery
+  + NAT traversal) is explicitly out of scope.
+- **IPv4 data plane only.** Headscale assigns tailnet IPv6, but
+  we don't route it yet.
+- **No persistence.** Every process start regenerates the node key.
+  Use `ephemeral=true` preauth keys or a `headscale nodes expire`
+  policy so stale entries don't accumulate.
+- **ICMP without raw sockets** returns admin-prohibited rather than
   forwarding; raw sockets need `CAP_NET_RAW` / Administrator.
-- Pure layer-3/4 NAT — no ALG (Application Layer Gateway). Protocols
-  that embed addresses in their payload (FTP active/PASV, SIP, H.323,
-  ...) break without a helper that parses and rewrites those embedded
-  addresses. Linux's `nf_conntrack_ftp` / `nf_nat_ftp` etc. are the
-  kernel equivalents; burrow has no analog.
+- **Pure layer-3/4 NAT** — no ALG. Protocols that embed addresses in
+  their payload (FTP active/PASV, SIP, H.323, …) break without a
+  helper that parses + rewrites those embedded addresses.
 
 ## Development
 
 ```sh
-cargo test                              # 101 lib + 32 integration tests
+cargo test                                # hermetic lib + integration tests
+cargo test --features insecure-tests      # plus real-DERP / real-Headscale tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-See `justfile` for cross-compile recipes and `scripts/` for the deploy
-helpers.
+Real-infra tests are gated on:
+
+- `BURROW_TEST_DERP_URL` — opts `tests/derp_real_roundtrip.rs` in.
+- `BURROW_TEST_HEADSCALE_URL` + `BURROW_TEST_HEADSCALE_AUTHKEY` —
+  opts `tests/headscale_register_roundtrip.rs` +
+  `tests/burrow_client_headscale.rs` in.
+
+Without those env vars the tests short-circuit cleanly so the
+hermetic suite stays green.
+
+Vendored tailscale-rs sits under `vendor/tailscale-rs/`; pinned commit
+in `vendor/tailscale-rs/REVISION`. Don't let `cargo fmt --all` walk
+into it — use `cargo fmt -p burrow` or `rustfmt --edition 2021 <files>`
+scoped to files you touched.
 
 ## License
 

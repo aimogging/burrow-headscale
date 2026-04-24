@@ -29,6 +29,11 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+/// Default TCP port the control listener binds on — 57821. Burrow
+/// listens on `(tailnet_ip, DEFAULT_CONTROL_PORT)`; `burrow-client
+/// tunnel`/`shell` targets this port unless `--control-port` is set.
+pub const DEFAULT_CONTROL_PORT: u16 = 57821;
+
 use crate::nat::NatKey;
 use crate::proxy::ProxyMsg;
 use crate::reverse_registry::{

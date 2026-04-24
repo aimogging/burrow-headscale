@@ -36,8 +36,7 @@ use ts_keys::NodePublicKey;
 use ts_transport_derp::RegionId;
 use url::Url;
 
-use crate::config::DEFAULT_CONTROL_PORT;
-use crate::control::{listener_key, spawn_control_handler};
+use crate::control::{listener_key, spawn_control_handler, DEFAULT_CONTROL_PORT};
 use crate::dataplane::{ingest_tunnel_packet, UdpProxyMap};
 use crate::derp::DerpClient;
 use crate::headscale::{ControlState, HeadscaleClient};

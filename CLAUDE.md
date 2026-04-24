@@ -1,14 +1,15 @@
 # burrow-headscale
 
 A userspace WireGuard gateway that joins a Tailscale-compatible tailnet
-(via Headscale coordination + DERP transport) instead of talking to a
-wg-quick-configured WG server. No TUN interface, no kernel drivers, no
-admin privileges beyond raw sockets for ICMP.
+via Headscale coordination + DERP transport. No TUN interface, no
+kernel drivers, no admin privileges beyond raw sockets for ICMP.
 
-This fork diverges from upstream burrow (see `git log --grep=stage-0`
-for the cut point). Headscale registration + DERP ride on top of the
-same smoltcp + NAT + reverse-tunnel machinery the upstream uses — the
-transport and coordination layers swap out, everything above doesn't.
+This fork diverged from upstream burrow at Stage 0 (see `git log
+--grep=stage-0` for the cut point) and retired the wg-quick transport
+in Stage 5. The smoltcp + NAT + reverse-tunnel machinery inherited
+from upstream is unchanged; only the transport (DERP in place of a
+fixed UDP peer) and coordination (Headscale in place of a hand-rolled
+wg-quick config) swapped out.
 
 ## Topology
 
@@ -174,7 +175,18 @@ Vendored tailscale-rs lives in `vendor/tailscale-rs/`; pinned commit in
   Both short-circuit cleanly without those vars so the suite stays
   hermetic.
 
-The wg-quick transport path (`src/main.rs::run`, uses `--config`) is
-still present for the transition but will be retired in Stage 5 of the
-plan. New development should target the headscale path
-(`src/hs_main.rs`, selected when `--server-url` is given).
+Binary entry points:
+- `src/main.rs` — the gateway. Always goes through `hs_main::run`.
+  Needs `--server-url`/`--authkey`/`--hostname` (or matching
+  `BURROW_HEADSCALE_*` env, or a build-time embed via
+  `--features embedded-headscale-config`).
+- `src/bin/burrow-client.rs` — companion CLI. Same top-level
+  credentials flags (propagated with `global = true`). When set,
+  `tunnel` / `shell` route through `burrow::client_session::ClientSession`
+  (DERP transport); when unset, they fall back to direct TCP — useful
+  for the in-process mock-server tests in `tests/burrow_client_cli.rs`.
+
+`burrow-client` subcommands: `tunnel`, `shell`, `login` (register +
+print tailnet IP, for scripts), `headscale-embed` (write the 2- or
+3-line file that feeds `BURROW_HEADSCALE_EMBED` at build time). The
+old `gen`/`keygen` subcommands retired with wg-quick in Stage 5.

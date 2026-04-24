@@ -3,33 +3,14 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=BURROW_EMBEDDED_CONFIG");
     println!("cargo:rerun-if-env-changed=BURROW_HEADSCALE_EMBED");
 
+    if env::var_os("CARGO_FEATURE_EMBEDDED_HEADSCALE_CONFIG").is_none() {
+        return;
+    }
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
-
-    if env::var_os("CARGO_FEATURE_EMBEDDED_CONFIG").is_some() {
-        emit_wgquick_embed(&out_dir);
-    }
-
-    if env::var_os("CARGO_FEATURE_EMBEDDED_HEADSCALE_CONFIG").is_some() {
-        emit_headscale_embed(&out_dir);
-    }
-}
-
-fn emit_wgquick_embed(out_dir: &PathBuf) {
-    let path = env::var("BURROW_EMBEDDED_CONFIG").expect(
-        "feature `embedded-config` is enabled but BURROW_EMBEDDED_CONFIG is not set; \
-         e.g. BURROW_EMBEDDED_CONFIG=./deploy.conf cargo build --features embedded-config",
-    );
-    println!("cargo:rerun-if-changed={path}");
-
-    let contents = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read BURROW_EMBEDDED_CONFIG ({path}): {e}"));
-
-    let dest = out_dir.join("embedded_config.rs");
-    let body = format!("pub const EMBEDDED_CONFIG: &str = {contents:?};\n");
-    fs::write(&dest, body).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    emit_headscale_embed(&out_dir);
 }
 
 /// Parse a 2- or 3-line file:
@@ -39,7 +20,7 @@ fn emit_wgquick_embed(out_dir: &PathBuf) {
 /// <hostname>        (optional — omit the line, or leave blank, to skip)
 /// ```
 /// and emit `$OUT_DIR/embedded_headscale.rs` containing a module-local
-/// `EMBEDDED_HEADSCALE: crate::embedded_headscale::HeadscaleEmbed`.
+/// `EMBEDDED_HEADSCALE: crate::HeadscaleEmbed`.
 fn emit_headscale_embed(out_dir: &PathBuf) {
     let path = env::var("BURROW_HEADSCALE_EMBED").expect(
         "feature `embedded-headscale-config` is enabled but BURROW_HEADSCALE_EMBED is not set; \

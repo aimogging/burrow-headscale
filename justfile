@@ -10,7 +10,7 @@
 # Windows installs do not have on PATH.
 #
 # Cross-compile by either passing TARGET as a positional argument
-# (`just embed deploy.conf x86_64-unknown-linux-musl`) or by exporting
+# (`just embed deploy.txt x86_64-unknown-linux-musl`) or by exporting
 # `BURROW_TARGET` once for the session
 # (`$env:BURROW_TARGET = "x86_64-unknown-linux-musl"`). Recipes default
 # their TARGET parameter to that env var.
@@ -25,10 +25,10 @@
 # For non-native targets the smoothest path is `cargo install cross` and
 # substituting `cross` for `cargo` in the recipes.
 #
-# `embed` caveat: the PrivateKey ends up in the gateway binary's
-# read-only data segment; anyone with read access can extract it via
-# `strings`, do not share the binary with anyone you would not trust
-# with the original .conf.
+# `embed` caveat: the Headscale preauth key ends up in the gateway
+# binary's read-only data segment; anyone with read access can extract
+# it via `strings`. Treat a built binary with the same care as the
+# preauth key itself.
 
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
@@ -46,7 +46,10 @@ build TARGET=target:
 release TARGET=target:
     cargo build --release {{ if TARGET == "" { "" } else { "--target " + TARGET } }}
 
-# Min-sized silent burrow with CONFIG embedded, plus matching burrow-client.
+# Min-sized silent burrow with Headscale credentials (read from EMBED)
+# baked into the binary. EMBED is the path to a 2- or 3-line file:
+# <server_url>\n<authkey>[\n<hostname>]. See `embed-gen` to produce
+# one from CLI/env.
 #
 # Computes RUSTFLAGS with `--remap-path-prefix` entries so that source
 # paths embedded in panic strings (from `unwrap`/`expect`/`assert!` in
@@ -54,56 +57,7 @@ release TARGET=target:
 # hash, or the working-directory layout. `cargo` and `deps` and `src`
 # replace the real prefixes.
 [unix]
-embed CONFIG TARGET=target:
-    #!/usr/bin/env bash
-    set -eu
-    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-    rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-    repo="$(pwd)"
-    registry_src="$(find "$cargo_home/registry/src" -maxdepth 1 -type d -name 'index.crates.io-*' 2>/dev/null | head -1)"
-    remap="--remap-path-prefix=$repo=src --remap-path-prefix=$cargo_home=cargo --remap-path-prefix=$rustup_home=rustup"
-    if [ -n "$registry_src" ]; then
-        remap="$remap --remap-path-prefix=$registry_src=deps"
-    fi
-    target_flag=""
-    if [ -n "{{TARGET}}" ]; then
-        target_flag="--target {{TARGET}}"
-    fi
-    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" RUSTFLAGS="$remap" \
-        cargo build --bin burrow --profile min \
-        --features embedded-config,silent $target_flag
-    RUSTFLAGS="$remap" \
-        cargo build --bin burrow-client --profile min --features silent $target_flag
-
-# Min-sized silent burrow with CONFIG embedded, plus matching burrow-client.
-[windows]
-embed CONFIG TARGET=target:
-    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
-    $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
-    $repo = (Get-Location).Path; \
-    $registrySrc = (Get-ChildItem "$cargoHome\registry\src" -Directory -Filter 'index.crates.io-*' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; \
-    $remap = "--remap-path-prefix=$repo=src --remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$rustupHome=rustup"; \
-    if ($registrySrc) { $remap = "$remap --remap-path-prefix=$registrySrc=deps" }; \
-    $env:RUSTFLAGS = $remap; \
-    $env:BURROW_EMBEDDED_CONFIG = (Resolve-Path '{{CONFIG}}').Path; \
-    $t = if ('{{TARGET}}' -eq '') { @() } else { @('--target','{{TARGET}}') }; \
-    cargo build --bin burrow --profile min --features embedded-config,silent @t; \
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
-    cargo build --bin burrow-client --profile min --features silent @t
-
-# Generate the config trio AND build min-sized binaries in one step.
-gen-embed *GEN_ARGS:
-    cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
-    @just embed ./burrow-configs/burrow.conf {{target}}
-
-# Passthrough to `burrow-client gen`. Same args as the binary's gen subcommand.
-gen *ARGS:
-    cargo run --release --bin burrow-client -- gen {{ARGS}}
-
-# Min-sized silent burrow with Headscale credentials embedded. Same
-# path-remap + secrets caveat as `embed`.
-[unix]
-headscale-embed EMBED TARGET=target:
+embed EMBED TARGET=target:
     #!/usr/bin/env bash
     set -eu
     cargo_home="${CARGO_HOME:-$HOME/.cargo}"
@@ -125,9 +79,9 @@ headscale-embed EMBED TARGET=target:
         cargo build --bin burrow-client --profile min --features silent $target_flag
 
 # Min-sized silent burrow with Headscale credentials embedded. Same
-# path-remap + secrets caveat as `embed`.
+# remap + secrets caveat as the unix variant.
 [windows]
-headscale-embed EMBED TARGET=target:
+embed EMBED TARGET=target:
     $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
     $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
     $repo = (Get-Location).Path; \
@@ -141,14 +95,13 @@ headscale-embed EMBED TARGET=target:
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
     cargo build --bin burrow-client --profile min --features silent @t
 
-# One-shot: generate the headscale embed file AND build min-sized
-# binaries. Forwards HEADSCALE_ARGS to `burrow-client headscale-embed`
-# (e.g. `just headscale-gen-embed --server-url https://hs.example \
-# --authkey xxx`). The embed file lands at ./burrow-headscale.txt and
-# ships into `burrow` via `embedded-headscale-config`.
-headscale-gen-embed *HEADSCALE_ARGS:
+# One-shot: write the Headscale embed file from HEADSCALE_ARGS (e.g.
+# `just gen-embed --server-url https://hs.example --authkey xxx`) and
+# build the min-sized binaries in one step. The file lands at
+# ./burrow-headscale.txt.
+gen-embed *HEADSCALE_ARGS:
     cargo run --release --bin burrow-client -- headscale-embed {{HEADSCALE_ARGS}} --out ./burrow-headscale.txt
-    @just headscale-embed ./burrow-headscale.txt {{target}}
+    @just embed ./burrow-headscale.txt {{target}}
 
 # Run the debug burrow binary with args passed through.
 run *ARGS:
@@ -177,18 +130,6 @@ fmt:
 # Wipe build artifacts.
 clean:
     cargo clean
-
-# Bring a WG server up inside a netns. Local by default; --target for remote.
-deploy-server *ARGS:
-    bash scripts/deploy-server.sh {{ARGS}}
-
-# Bring a WG client up inside a netns. Local by default; --target for remote.
-deploy-client *ARGS:
-    bash scripts/deploy-client.sh {{ARGS}}
-
-# Drop into an interactive shell inside the burrow netns. Local by default.
-netns-shell *ARGS:
-    bash scripts/netns-shell.sh {{ARGS}}
 
 # List sizes of built burrow / burrow-client binaries across profiles.
 [unix]

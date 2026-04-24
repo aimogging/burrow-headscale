@@ -15,10 +15,8 @@
 use smoltcp::iface::{Config as IfaceConfig, Interface};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr};
 use tokio::sync::mpsc::{self, error::TryRecvError};
-
-use crate::config::Ipv4Cidr;
 
 /// MTU presented to smoltcp. WireGuard adds 32 bytes of overhead to a 1500
 /// byte underlying MTU; we round to a safe 1420.

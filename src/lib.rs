@@ -1,5 +1,3 @@
-pub mod config;
-pub mod config_gen;
 pub mod control;
 pub mod dataplane;
 pub mod dns_service;

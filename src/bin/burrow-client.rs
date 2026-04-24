@@ -17,16 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use burrow::client_session::ClientSession;
-use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
-use burrow::config_gen::{generate, GenParams};
+use burrow::control::DEFAULT_CONTROL_PORT;
 use burrow::reverse_registry::OpenRequest;
 use burrow::shell_protocol as sp;
 use burrow::wire::{
@@ -115,11 +113,6 @@ enum Cmd {
         #[command(flatten)]
         args: ShellArgs,
     },
-    /// Generate an x25519 keypair (base64) for use in a wg-quick config.
-    Keygen,
-    /// Generate a ready-to-use trio of configs: server.conf, burrow.conf,
-    /// clientN.conf.
-    Gen(GenArgs),
     /// Register this client as a tailnet node against a Headscale server.
     /// Prints the tailnet IPv4 that Headscale assigns, then exits.
     ///
@@ -211,41 +204,6 @@ struct ShellArgs {
     args: Vec<String>,
 }
 
-#[derive(clap::Args, Debug)]
-struct GenArgs {
-    /// WG server's public `ip:port`.
-    #[arg(long)]
-    endpoint: String,
-    /// Routes (CIDRs) to expose via burrow. Comma-separated; pass
-    /// `--routes a,b,c` to expose multiple.
-    #[arg(long, value_delimiter = ',', default_value = "")]
-    routes: Vec<String>,
-    /// DNS servers to write into each client.conf. Comma-separated.
-    /// Omit (the default) for no `DNS = ` line — clients keep their
-    /// system resolver. Pass the burrow host's WG IP (e.g. 10.0.0.2)
-    /// to opt clients into burrow's built-in resolver.
-    #[arg(long, value_delimiter = ',', default_value = "")]
-    dns: Vec<String>,
-    /// WG network subnet. Server=.1, burrow=.2, clients=.10+.
-    #[arg(long, default_value = "10.0.0.0/24")]
-    subnet: String,
-    /// Number of client peers to generate.
-    #[arg(long, default_value_t = 1)]
-    clients: u16,
-    /// WG server's UDP listen port.
-    #[arg(long, default_value_t = 51820)]
-    listen_port: u16,
-    /// Output directory (created if missing). Existing files are overwritten.
-    #[arg(long, default_value = "burrow-configs")]
-    out: PathBuf,
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-enum OutputTarget {
-    Stdout,
-    File,
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -289,8 +247,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let target = target_for(&session, burrow_ip, control_port);
             run_shell(target, args).await
         }
-        Cmd::Keygen => keygen(),
-        Cmd::Gen(args) => gen_configs(args),
         Cmd::Login {
             server_url,
             authkey,
@@ -440,68 +396,6 @@ fn run_headscale_embed(
         out.display()
     );
     println!("      --features embedded-headscale-config,silent --bin burrow");
-    Ok(ExitCode::SUCCESS)
-}
-
-fn keygen() -> Result<ExitCode> {
-    let secret = x25519_dalek::StaticSecret::random();
-    let public = x25519_dalek::PublicKey::from(&secret);
-    let b64 = base64::engine::general_purpose::STANDARD;
-    println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
-    println!("PublicKey  = {}", b64.encode(public.as_bytes()));
-    Ok(ExitCode::SUCCESS)
-}
-
-fn gen_configs(args: GenArgs) -> Result<ExitCode> {
-    // clap's value_delimiter on a String with default_value = "" yields
-    // vec![""] rather than empty — filter blanks here.
-    let filter_blank = |v: Vec<String>| -> Vec<String> {
-        v.into_iter().filter(|s| !s.trim().is_empty()).collect()
-    };
-    let routes = filter_blank(args.routes);
-    let dns = filter_blank(args.dns);
-    let subnet = parse_ipv4_cidr(&args.subnet)
-        .with_context(|| format!("invalid --subnet `{}`", args.subnet))?;
-    let params = GenParams {
-        endpoint: args.endpoint,
-        routes,
-        dns,
-        subnet,
-        clients: args.clients,
-        listen_port: args.listen_port,
-        control_port: DEFAULT_CONTROL_PORT,
-    };
-    let configs = generate(&params)?;
-
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("failed to create {}", args.out.display()))?;
-    for c in &configs {
-        let path = args.out.join(&c.filename);
-        std::fs::write(&path, &c.contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        set_private_file_permissions(&path);
-    }
-
-    println!(
-        "wrote {} config(s) to {}:",
-        configs.len(),
-        args.out.display()
-    );
-    for c in &configs {
-        println!("  {}", c.filename);
-    }
-    println!();
-    println!("next:");
-    println!("  server:  wg-quick up ./server.conf    (on the WG server)");
-    println!("  burrow:  burrow --config ./burrow.conf   (on the gateway host)");
-    if params.clients == 1 {
-        println!("  client:  wg-quick up ./client1.conf   (on the client)");
-    } else {
-        println!(
-            "  clients: wg-quick up ./clientN.conf   (N = 1..{}, one per client machine)",
-            params.clients
-        );
-    }
     Ok(ExitCode::SUCCESS)
 }
 
