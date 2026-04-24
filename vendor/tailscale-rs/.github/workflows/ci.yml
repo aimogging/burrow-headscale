@@ -1,0 +1,107 @@
+name: rust
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  schedule:
+    # Nightly run; execute daily at 06:37 AM UTC on main (default branch).
+    - cron: '37 6 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        is_pr_or_push:
+          - ${{github.event_name == 'pull_request' || github.event_name == 'push'}}
+        target:
+          - triple: x86_64-unknown-linux-gnu
+            runner: linux-x86_64-16cpu
+          - triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-16cpu
+          - triple: aarch64-apple-darwin
+            runner: macos-26
+        toolchain:
+          - version: 1.93.1
+            label: prev
+          - version: 1.94.0
+            label: latest
+        exclude:
+          # Don't run macOS builds on PR/push workflows; only on the nightly workflow.
+          - is_pr_or_push: true
+            target:
+              triple: aarch64-apple-darwin
+    # The name needs to remain stable for the "Require status checks to pass" feature of our branch
+    # protection rules to work, thus the "toolchain.label" field in the matrix. Unfortunately the
+    # status check matching on job name doesn't support regexes, just an exact job name match.
+    name: test (rust ${{ matrix.toolchain.label }}, ${{ matrix.target.triple }})
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup rust
+        id: setup-rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: ${{ matrix.toolchain.version }}
+          builder-triple: ${{ matrix.target.triple }}
+          components: clippy
+      - name: Lint lib targets (cargo clippy)
+        run: |-
+          cargo +${{ matrix.toolchain.version }} clippy \
+            --all-features --workspace --no-deps \
+            --lib \
+            --target ${{ matrix.target.triple }} \
+            -- -D warnings
+        # These are separated from `--lib` to avoid enforcing missing docs in targets that
+        # can't become part of public API
+      - name: Lint other targets (cargo clippy)
+        run: |-
+          cargo +${{ matrix.toolchain.version }} clippy \
+            --all-features --workspace --no-deps \
+            --bins --tests --benches --examples \
+            --target ${{ matrix.target.triple }} \
+            -- -D warnings -A missing_docs
+      - name: Build (cargo build)
+        run: cargo +${{ matrix.toolchain.version }} build --all-features --workspace --verbose --all-targets --target ${{ matrix.target.triple }}
+      - name: Test (cargo test)
+        run: cargo +${{ matrix.toolchain.version }} test --all-features --workspace --verbose --target ${{ matrix.target.triple }}
+      - name: Release build (cargo build --release)
+        run: cargo +${{ matrix.toolchain.version }} build --all-features --workspace --release --verbose --all-targets --target ${{ matrix.target.triple }}
+      - name: Docs (cargo doc)
+        run: cargo +${{ matrix.toolchain.version }} doc --workspace --no-deps --all-features --target ${{ matrix.target.triple }}
+
+  arch_independent:
+    name: arch-independent checks
+    runs-on: linux-x86_64-16cpu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup rust
+        id: setup-rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-version: nightly
+          builder-triple: x86_64-unknown-linux-gnu
+          components: rustfmt
+      - name: binstall
+        uses: cargo-bins/cargo-binstall@main
+      - name: Install cargo-deny
+        run: command -v cargo-deny || cargo binstall --no-confirm cargo-deny
+      - name: Check for unused dependencies (cargo machete)
+        uses: bnjbvr/cargo-machete@main
+        with:
+          args: "--with-metadata"
+      - name: Dependency audit (cargo deny)
+        run: cargo deny --workspace --all-features check all
+      - name: Check formatting (cargo fmt)
+        run: cargo +nightly fmt --check
+      - name: Custom workspace checks
+        run: cargo run -p checks
