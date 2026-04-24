@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -64,6 +65,12 @@ const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// top of the usual TCP RTT.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Lowest ephemeral port we hand out for outbound sockets. smoltcp
+/// 0.13 rejects port 0 on `connect()` (despite docs — see the comment
+/// in `tests/originated_outbound_tcp.rs`), so `ClientSession` runs its
+/// own monotonic allocator starting here and wrapping at 65535.
+const EPHEMERAL_PORT_FLOOR: u16 = 49152;
+
 /// Per-stream event forwarded by the dispatcher task to its
 /// `DerpTcpStream`.
 #[derive(Debug)]
@@ -85,6 +92,10 @@ pub struct ClientSession {
     headscale: HeadscaleClient,
     streams: StreamRegistry,
     tasks: Vec<JoinHandle<()>>,
+    /// Monotonic ephemeral-port allocator for outbound connects.
+    /// `fetch_add` wraps at `u16::MAX`; we offset into the RFC 6335
+    /// ephemeral range [`EPHEMERAL_PORT_FLOOR`..=65535] on each call.
+    next_ephemeral: Arc<AtomicU16>,
 }
 
 impl ClientSession {
@@ -170,7 +181,19 @@ impl ClientSession {
             headscale,
             streams,
             tasks,
+            next_ephemeral: Arc::new(AtomicU16::new(0)),
         })
+    }
+
+    fn alloc_ephemeral_port(&self) -> u16 {
+        // fetch_add wraps at u16::MAX; remap into the [49152..=65535]
+        // range (16384 slots). Collisions inside the process are
+        // possible after 16k connects — smoltcp surfaces them as
+        // `tcp connect: Unaddressable`, which we'd see on open_tcp.
+        // At a CLI's scale (<10 outbound flows per session) it's a
+        // non-issue.
+        let n = self.next_ephemeral.fetch_add(1, Ordering::Relaxed);
+        EPHEMERAL_PORT_FLOOR + (n % (u16::MAX - EPHEMERAL_PORT_FLOOR + 1))
     }
 
     pub fn tailnet_ip(&self) -> Ipv4Addr {
@@ -200,7 +223,7 @@ impl ClientSession {
         }
 
         let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let local = SocketAddrV4::new(self.tailnet_ip, 0);
+        let local = SocketAddrV4::new(self.tailnet_ip, self.alloc_ephemeral_port());
         let remote = SocketAddrV4::new(dst, port);
         let id = self
             .smoltcp

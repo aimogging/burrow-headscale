@@ -73,7 +73,11 @@ fn burrow_binary_path() -> &'static str {
 
 /// Spawn `burrow --server-url ... --authkey ... --hostname ...` as a
 /// child process. Returns the handle so the test can tear it down on
-/// exit, plus a stderr reader for discovering the assigned tailnet IP.
+/// exit, plus a stdout reader for discovering the assigned tailnet IP.
+///
+/// `tracing_subscriber::fmt()` writes to stdout by default, so lifecycle
+/// logs (including the `registered with Headscale tailnet_ip=...` line
+/// we parse for discovery) land on the child's stdout — not stderr.
 fn spawn_burrow(url: &str, authkey: &str, hostname: &str) -> std::io::Result<Child> {
     Command::new(burrow_binary_path())
         .args([
@@ -84,10 +88,15 @@ fn spawn_burrow(url: &str, authkey: &str, hostname: &str) -> std::io::Result<Chi
             "--hostname",
             hostname,
         ])
-        // Force info-level tracing for our lookup; stdout is silent on
-        // the happy path, all lifecycle logs go to stderr.
+        // Force info-level tracing for our lookup so the "registered"
+        // line is emitted even if the parent test doesn't export
+        // RUST_LOG. `NO_COLOR=1` stops tracing-subscriber from
+        // wrapping field names in ANSI escapes — without this the
+        // `tailnet_ip=` substring our parser looks for is split by
+        // `\x1b[3m...\x1b[0m` sequences and never matches.
         .env("RUST_LOG", "info,burrow=info,ts_control=warn")
-        .stdout(Stdio::null())
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -105,12 +114,12 @@ fn extract_tailnet_ip(line: &str) -> Option<Ipv4Addr> {
     tail[..end].parse().ok()
 }
 
-/// Drain `stderr` line-by-line until we find the IP log. Also forward
+/// Drain `stdout` line-by-line until we find the IP log. Also forward
 /// every line to the test writer so troubleshooting a stuck subprocess
 /// is easy (cargo test --nocapture).
 async fn wait_for_tailnet_ip(child: &mut Child, deadline: Duration) -> Option<Ipv4Addr> {
-    let stderr = child.stderr.take().expect("stderr piped");
-    let mut reader = BufReader::new(stderr).lines();
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout).lines();
     let discover = async move {
         while let Ok(Some(line)) = reader.next_line().await {
             eprintln!("burrow-subprocess: {line}");
