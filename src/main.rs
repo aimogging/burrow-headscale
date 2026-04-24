@@ -14,18 +14,14 @@ use tracing_subscriber::EnvFilter;
 
 use burrow::config;
 use burrow::control::{listener_key, spawn_control_handler};
-use burrow::icmp::{
-    build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder, ICMP_CODE_HOST_UNREACHABLE,
-    ICMP_CODE_NET_UNREACHABLE,
-};
+use burrow::dataplane::{ingest_tunnel_packet, UdpProxyMap};
+use burrow::icmp::IcmpForwarder;
 use burrow::nat::{NatKey, NatTable};
-use burrow::probe::{classify_connect_error, ConnectClass};
 use burrow::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
 use burrow::reverse_registry::ReverseRegistry;
-use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
-use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
+use burrow::rewrite;
+use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
 use burrow::tunnel::WgTunnel;
-use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
 /// Optional config baked in at build time via the `embedded-config` feature.
 /// The path is taken from `BURROW_EMBEDDED_CONFIG` at build time; `build.rs`
@@ -47,12 +43,6 @@ const EMBEDDED_CONFIG: Option<&str> = {
         None
     }
 };
-
-/// `udp_proxies` is touched on every UDP packet (ingress task) and on the
-/// 10s NAT sweep — real but minimal contention. `std::sync::Mutex` is the
-/// right tool: critical sections are bounded HashMap ops with no `.await`
-/// held; tokio's Mutex pays for park/unpark uncontended for no benefit.
-type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 
 /// The gateway binary is intentionally minimal: just the runtime. All
 /// utility commands (keygen, gen) live in `burrow-client` so they
@@ -439,146 +429,6 @@ async fn run(
     result
 }
 
-/// Take a decrypted IPv4 packet from the WG tunnel, run NAT rewrite, and
-/// dispatch by protocol: TCP into smoltcp, UDP into the per-entry forwarder,
-/// ICMP into the dedicated forwarder.
-async fn ingest_tunnel_packet(
-    mut packet: Vec<u8>,
-    smoltcp: &SmoltcpHandle,
-    nat: &Arc<NatTable>,
-    udp_proxies: &UdpProxyMap,
-    egress_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    arm_tx: &mpsc::UnboundedSender<(NatKey, TcpStream)>,
-    icmp: &Arc<IcmpForwarder>,
-    wg_ip: std::net::Ipv4Addr,
-    dns_enabled: bool,
-) {
-    let view = match rewrite::parse_5tuple(&packet) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!(error = %e, "non-IPv4 / unparseable tunnel packet, dropping");
-            return;
-        }
-    };
-    // Packets addressed to burrow's WG IP: smoltcp owns the TCP stack
-    // (control listener, reverse-tunnel TCP, originated outbound
-    // responses). UDP is handled separately — it's intercepted here
-    // for reverse-tunnel forwarding without going through smoltcp.
-    if view.dst_ip == wg_ip && view.proto == PROTO_TCP {
-        smoltcp.enqueue_inbound(packet);
-        return;
-    }
-    // ICMP to wg_ip: answer echo requests packet-level. smoltcp's
-    // built-in echo-reply is bypassed by `set_any_ip(true)` and
-    // binding an ICMP socket with a wildcard identifier isn't
-    // supported (Endpoint::Unspecified is reject-only). So we do the
-    // reply ourselves — swap src/dst, flip the ICMP type, echo the
-    // payload. Other ICMP traffic (peers pinging LAN hosts via
-    // burrow's NAT path) continues through `IcmpForwarder`.
-    if view.dst_ip == wg_ip && view.proto == PROTO_ICMP {
-        if let Some(reply) = build_echo_reply_for_wg_ip(&packet, wg_ip) {
-            let _ = egress_tx.send(reply);
-        }
-        return;
-    }
-    if view.dst_ip == wg_ip && view.proto == PROTO_UDP {
-        burrow::udp_reverse::dispatch_udp_to_wg_ip(&packet, &view, wg_ip, egress_tx, dns_enabled)
-            .await;
-        return;
-    }
-    match view.proto {
-        PROTO_TCP => {
-            // Compute the prospective NatKey from the packet's natural
-            // 5-tuple WITHOUT triggering rewrite/registration yet — the
-            // probe path needs to claim the slot before any rewrite, so
-            // retransmits during the probe see Pending and short-circuit.
-            let key = NatKey {
-                proto: PROTO_TCP,
-                peer_ip: view.src_ip,
-                peer_port: view.src_port,
-                original_dst_ip: view.dst_ip,
-                original_dst_port: view.dst_port,
-            };
-            let entry = nat.get(key);
-            match entry {
-                Some(e) if e.smoltcp_id.is_some() => {
-                    // Fast path: listener exists, just rewrite and enqueue.
-                    if let Err(err) = nat.rewrite_inbound(&mut packet) {
-                        warn!(?key, error = %err, "nat rewrite_inbound (tcp fast path) failed");
-                        return;
-                    }
-                    smoltcp.enqueue_inbound(packet);
-                }
-                Some(_) => {
-                    // Probe in flight (Pending, no smoltcp_id yet). This is
-                    // a SYN retransmit — drop. The probe will resolve and
-                    // either enqueue the original SYN (success) or send
-                    // back a RST (failure).
-                    debug!(?key, "tcp packet during connect probe — dropping");
-                }
-                None => {
-                    // No entry: only kick off a probe for a fresh SYN.
-                    // Anything else is stale traffic with no listener and
-                    // should be dropped silently.
-                    use smoltcp::wire::{Ipv4Packet, TcpPacket};
-                    let is_syn_only = Ipv4Packet::new_checked(&packet[..])
-                        .ok()
-                        .and_then(|ip| {
-                            TcpPacket::new_checked(ip.payload())
-                                .ok()
-                                .map(|tcp| tcp.syn() && !tcp.ack())
-                        })
-                        .unwrap_or(false);
-                    if !is_syn_only {
-                        debug!(?key, "tcp packet to unknown flow (not SYN) — dropping");
-                        return;
-                    }
-                    let smoltcp = smoltcp.clone();
-                    let nat = Arc::clone(nat);
-                    let arm_tx = arm_tx.clone();
-                    let egress_tx = egress_tx.clone();
-                    tokio::spawn(async move {
-                        connect_probe(packet, key, smoltcp, nat, arm_tx, egress_tx).await;
-                    });
-                }
-            }
-        }
-        PROTO_UDP => {
-            let key = match nat.rewrite_inbound(&mut packet) {
-                Ok((k, _, _)) => k,
-                Err(e) => {
-                    warn!(error = %e, "nat rewrite_inbound (udp) failed");
-                    return;
-                }
-            };
-            let payload = match extract_udp_payload(&packet) {
-                Some(p) => p,
-                None => {
-                    debug!(?key, "malformed udp datagram");
-                    return;
-                }
-            };
-            let tx = {
-                let mut map = udp_proxies.lock().unwrap();
-                map.entry(key)
-                    .or_insert_with(|| spawn_udp_proxy(key, egress_tx.clone()))
-                    .clone()
-            };
-            if tx.send(payload).is_err() {
-                // Stale proxy sender — its task already exited. Drop the entry
-                // so the next datagram spawns a fresh one.
-                udp_proxies.lock().unwrap().remove(&key);
-            }
-        }
-        PROTO_ICMP => {
-            icmp.handle_inbound(packet).await;
-        }
-        other => {
-            debug!(proto = other, "unsupported proto, dropping");
-        }
-    }
-}
-
 async fn egress_loop(
     tunnel: Arc<WgTunnel>,
     mut tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -604,130 +454,4 @@ async fn egress_loop(
             warn!(error = %e, "wg send");
         }
     }
-}
-
-/// Phase 9 fix #1 + Phase 11 probe-error fidelity: try to dial the OS-side
-/// destination *before* letting smoltcp answer the peer's SYN. Outcomes,
-/// classified by the kernel's connect() errno so the peer observes the same
-/// port-state nmap would see on a direct route:
-///
-///   * Connect succeeds → arm the stream for the event loop, register the
-///     smoltcp listener, enqueue the original SYN. Smoltcp emits SYN-ACK
-///     and the proxy task takes over once `TcpConnected` fires.
-///   * ECONNREFUSED → synthesize a TCP RST and tunnel it back. Peer sees
-///     `closed`.
-///   * EHOSTUNREACH / ENETUNREACH → synthesize ICMP Type 3 Code 1 / 0. Peer
-///     sees `filtered` (or the specific unreach code, if it cares).
-///   * ETIMEDOUT / other → drop silently, let the peer's own SYN retries
-///     time out. Peer sees `filtered`.
-///
-/// Pre-Phase-11 every failure synthesized a RST, which misreported firewall
-/// drops as closed ports (the exact nmap-is-through-burrow tell Phase 11
-/// closes). We also no longer wrap connect in `tokio::time::timeout`: the
-/// kernel's native SYN-retry budget (~21s Windows / ~127s Linux) is the
-/// right upper bound, and truncating it would reintroduce the same
-/// misclassification issue.
-///
-/// `try_reserve_pending` claims the NAT slot up-front, so SYN retransmits
-/// arriving while this probe is in flight see a Pending entry and are
-/// dropped by the dispatch in `ingest_tunnel_packet` rather than starting
-/// a second probe.
-async fn connect_probe(
-    mut packet: Vec<u8>,
-    key: NatKey,
-    smoltcp: SmoltcpHandle,
-    nat: Arc<NatTable>,
-    arm_tx: mpsc::UnboundedSender<(NatKey, TcpStream)>,
-    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
-) {
-    // Capture peer's SYN sequence number BEFORE any rewrite mutates the
-    // packet — needed if we have to synthesize a RST.
-    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if packet.len() < ihl + 8 {
-        debug!(?key, "probe: malformed SYN, dropping");
-        return;
-    }
-    let peer_seq = u32::from_be_bytes([
-        packet[ihl + 4],
-        packet[ihl + 5],
-        packet[ihl + 6],
-        packet[ihl + 7],
-    ]);
-
-    // Claim the NAT slot first so concurrent retransmits short-circuit.
-    match nat.try_reserve_pending(key) {
-        Ok(Some(_)) => { /* fresh — proceed */ }
-        Ok(None) => {
-            // Lost a race — another task is already probing for this exact
-            // 5-tuple. Drop this duplicate.
-            debug!(?key, "probe: another probe already in flight; dropping");
-            return;
-        }
-        Err(e) => {
-            warn!(?key, error = %e, "probe: cannot reserve NAT slot");
-            return;
-        }
-    };
-
-    let dst = (key.original_dst_ip, key.original_dst_port);
-    let stream = match TcpStream::connect(dst).await {
-        Ok(s) => s,
-        Err(e) => {
-            let class = classify_connect_error(&e);
-            debug!(?key, ?class, error = %e, "probe: OS connect failed");
-            match class {
-                ConnectClass::Refused => send_rst(&egress_tx, key, peer_seq),
-                ConnectClass::HostUnreachable => {
-                    send_dest_unreachable(&egress_tx, &packet, ICMP_CODE_HOST_UNREACHABLE);
-                }
-                ConnectClass::NetUnreachable => {
-                    send_dest_unreachable(&egress_tx, &packet, ICMP_CODE_NET_UNREACHABLE);
-                }
-                ConnectClass::Filtered => { /* drop silently — peer times out */ }
-            }
-            nat.evict_key(key);
-            return;
-        }
-    };
-
-    // Hand the stream off BEFORE enqueueing the SYN — guarantees that the
-    // event loop has the stream parked by the time the matching
-    // TcpConnected event arrives.
-    if arm_tx.send((key, stream)).is_err() {
-        warn!(?key, "probe: event loop receiver gone; aborting");
-        nat.evict_key(key);
-        return;
-    }
-
-    // Now actually rewrite the SYN and register the listener. Idempotent
-    // against the slot try_reserve_pending already created.
-    let (virtual_ip, gateway_port) = match nat.rewrite_inbound(&mut packet) {
-        Ok((_, vip, gw)) => (vip, gw),
-        Err(e) => {
-            warn!(?key, error = %e, "probe: rewrite_inbound failed post-connect");
-            nat.evict_key(key);
-            return;
-        }
-    };
-    if smoltcp
-        .ensure_listener(virtual_ip, gateway_port, key)
-        .await
-        .is_err()
-    {
-        error!(?key, "probe: smoltcp dropped ensure_listener reply");
-        nat.evict_key(key);
-        return;
-    }
-    smoltcp.enqueue_inbound(packet);
-}
-
-fn send_rst(egress_tx: &mpsc::UnboundedSender<Vec<u8>>, key: NatKey, peer_seq: u32) {
-    let rst = build_tcp_rst(
-        key.original_dst_ip,
-        key.peer_ip,
-        key.original_dst_port,
-        key.peer_port,
-        peer_seq.wrapping_add(1),
-    );
-    let _ = egress_tx.send(rst);
 }
