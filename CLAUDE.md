@@ -1,143 +1,180 @@
-# burrow — WireGuard Userspace Gateway
+# burrow-headscale
 
-A CLI tool that runs on a host inside a private network, connects outbound to a WireGuard server, and acts as a transparent MASQUERADE NAT gateway for other WireGuard peers — with no TUN interface, no kernel drivers, and no OS network configuration required.
+A userspace WireGuard gateway that joins a Tailscale-compatible tailnet
+(via Headscale coordination + DERP transport) instead of talking to a
+wg-quick-configured WG server. No TUN interface, no kernel drivers, no
+admin privileges beyond raw sockets for ICMP.
 
-## Problem Statement
+This fork diverges from upstream burrow (see `git log --grep=stage-0`
+for the cut point). Headscale registration + DERP ride on top of the
+same smoltcp + NAT + reverse-tunnel machinery the upstream uses — the
+transport and coordination layers swap out, everything above doesn't.
 
-Enable a host behind NAT on a private network to act as a gateway for external WireGuard peers to reach internal resources, without requiring:
-- A TUN/TAP interface
-- Kernel drivers (Wintun, wireguard-nt, etc.)
-- Root/Administrator privileges (beyond raw sockets for ICMP)
-- Any changes to the internal network
-
-## Network Topology
+## Topology
 
 ```
-[my client]
-    | WireGuard peer
-    v
-[WireGuard server]  ← standard Linux WireGuard, publicly reachable
-    | routes via AllowedIPs
-    v
-[burrow — NAT gateway]  ← behind NAT on internal network, connects outbound
-    | real OS sockets
-    v
-[internal network hosts]
+ tailnet peer (burrow-client or any tailscale node)
+                   │  DERP relay
+                   ▼
+              [DERP server]   ← Tailscale's derper or Headscale embedded
+                   │  DERP relay
+                   ▼
+ burrow-headscale (behind NAT, no inbound port)
+                   │  real OS sockets, MASQUERADE
+                   ▼
+               LAN hosts
+
+                   │  separately: HTTPS + Noise IK
+                   ▼
+             [Headscale control server]
 ```
 
-### WireGuard Server Config
+Coordination: Headscale issues node identities + assigns tailnet IPs +
+keeps the netmap current.
+Transport: DERP relays encrypted WG datagrams between peers (no
+direct P2P — Tailscale's NAT-traversal magic is out of scope here,
+DERP-only by design).
+Data plane: boringtun `Tunn` per peer (decrypts inbound, encrypts
+outbound) → smoltcp netstack → NAT → real OS sockets to LAN.
 
-The server routes between peers using AllowedIPs:
-
-```ini
-[Peer]
-# my client
-PublicKey = ...
-AllowedIPs = 10.0.0.1/32
-
-[Peer]
-# burrow (this tool)
-PublicKey = ...
-AllowedIPs = 10.0.0.2/32, 192.168.1.0/24   # advertises the internal network
-```
-
-`net.ipv4.ip_forward = 1` must be set on the server.
-
-### NAT Gateway Behavior
-
-- Connects outbound to the WireGuard server via UDP (NAT-friendly)
-- Maintains the NAT mapping with PersistentKeepalive
-- Receives IP packets from WireGuard peers destined for internal hosts
-- Opens real OS sockets to those destinations (MASQUERADE: internal hosts see gateway's real LAN IP)
-- Returns responses through the WireGuard tunnel with correct src/dst
-
-"My client" requires no special configuration — it just routes to its WireGuard interface normally.
+Node identity is regenerated at every process start; nothing persists
+to disk. Headscale's `ephemeral=true` registration flag means stale
+entries age out on their own.
 
 ## Architecture
 
 ```
-[UDP socket] ←→ boringtun Tunn (WireGuard encap/decap)
-                      ↕ raw IP packets
-              [destination rewrite shim]
-                      ↕
-              smoltcp Interface (userspace TCP/IP)
-                      ↕ smoltcp TCP/UDP sockets
-              [NAT table lookup → real OS sockets]
-                      ↕
-              [internal network hosts]
+[DERP WebSocket] ←→ peer_table (Tunn per NodePublicKey)
+                         ↕ plaintext IPv4
+                 [destination rewrite shim]
+                         ↕
+                 smoltcp Interface
+                         ↕ TCP/UDP sockets
+                 [NAT table → real OS sockets]
+                         ↕
+                   LAN hosts
 ```
 
-### Destination Rewrite (transparent proxy shim)
+### Destination rewrite (transparent proxy shim)
 
-smoltcp only processes packets destined for its configured interface address. To handle arbitrary destinations transparently:
+smoltcp only processes packets destined for its interface address. To
+handle arbitrary tailnet destinations transparently we rewrite the dst
+IP to the synthetic `198.18.0.0/15` range on ingress and restore it on
+egress. The NAT table holds the original 5-tuple so both directions
+resolve.
 
-1. **Inbound** (from WireGuard tunnel → smoltcp):
-   - Intercept packet before smoltcp
-   - Record `(src_ip, src_port, dst_ip, dst_port)` → `original_dst` in NAT table
-   - Rewrite `dst` to smoltcp's interface IP (e.g. `10.0.0.2`)
-   - Feed rewritten packet to smoltcp
+1. **Inbound** (peer → DERP → burrow → smoltcp): record
+   `(proto, src_ip, src_port, dst_ip, dst_port)` → `original_dst`,
+   rewrite `dst_ip` to smoltcp's interface addr, enqueue.
+2. **smoltcp accepts** the connection (it thinks the client connected
+   directly).
+3. **Outbound** (smoltcp → LAN): look up `original_dst` in the NAT
+   table, open a real OS TCP/UDP socket, proxy bytes both ways.
+4. **Response** (LAN → smoltcp → DERP): smoltcp produces a packet with
+   `src = interface_addr`; rewrite `src` back to `original_dst_ip` so
+   the peer sees the same address it dialled.
 
-2. **smoltcp accepts** the connection (it thinks the client is connecting to it directly)
+### Protocol support
 
-3. **Outbound** (smoltcp data → internal network):
-   - Look up original destination from NAT table
-   - Open real OS `TcpStream` / `UdpSocket` to `original_dst`
-   - Proxy data between smoltcp socket and real OS socket
-
-4. **Response** (internal network → WireGuard tunnel):
-   - Receive data from real OS socket
-   - Feed back through smoltcp
-   - smoltcp constructs response packet: `src=10.0.0.2, dst=10.0.0.1`
-   - Rewrite `src` back to `original_dst` (e.g. `192.168.1.50`)
-   - Feed to boringtun → encrypt → send to WireGuard server
-
-### Protocol Support
-
-| Protocol | Approach |
+| Proto | Approach |
 |---|---|
-| TCP | smoltcp state machine + real OS `TcpStream` |
-| UDP | stateless NAT table + real OS `UdpSocket` |
-| ICMP | raw socket (requires privilege); graceful fallback if unavailable |
-
-If raw socket creation fails at startup, ICMP echo requests from peers receive **ICMP Type 3, Code 13 (Communication Administratively Prohibited)** in response. This is constructed in userspace and injected back through the WireGuard tunnel — no raw socket needed to send it. The response is semantically accurate (policy/privilege blocked it) and distinguishable from host-unreachable or timeout.
+| TCP   | smoltcp state machine + real OS `TcpStream` |
+| UDP   | stateless NAT table + real OS `UdpSocket` |
+| ICMP  | raw socket if available; otherwise Type 3 Code 13 synthesised in userspace |
 
 ## Constraints
 
-- **No Go** — Rust only
-- **No GUI** — CLI only
-- **No TUN interface** — no Wintun, wireguard-nt, or `/dev/tun`
-- **No kernel drivers**
-- **Cross-platform** — must work on Windows; Linux support is a bonus
-- **IPv4 only** in initial version; IPv6 deferred
-- Behavior should mirror what `boringtun` + `iptables -j MASQUERADE` achieves on Linux
+- Rust only. No Go, no GUI.
+- No TUN interface, no kernel drivers. Cross-platform (Windows first,
+  Linux second).
+- IPv4-only data plane for now. Control-plane IPv6 is present (tailnet
+  IPv6 is assigned by Headscale) but we don't route it.
+- Nothing persists to disk — fresh node identity every boot.
 
-## Crates
+## Key crates
 
 | Crate | Role |
 |---|---|
-| `boringtun` (no `device` feature) | WireGuard noise protocol (encap/decap) |
+| `boringtun` (no `device`) | WireGuard noise protocol (encap/decap), one `Tunn` per peer |
+| `ts_control`, `ts_control_noise`, `ts_control_serde` | Headscale handshake + netmap stream |
+| `ts_transport_derp`, `ts_packet`, `ts_keys` | DERP WebSocket client + framing + key types |
 | `smoltcp` | Userspace TCP/IP stack |
-| `tokio` | Async runtime, UDP/TCP I/O |
-| `clap` | CLI argument parsing |
+| `tokio` | Async runtime |
+| `dashmap` | Lock-free PeerTable indices |
 
-## Key Design Decisions
+Vendored tailscale-rs lives in `vendor/tailscale-rs/`; pinned commit in
+`vendor/tailscale-rs/REVISION`.
 
-- **No device feature**: `boringtun` is used as a pure protocol library (`noise::Tunn`). The entire `device` module (epoll, TUN, UAPI socket) is excluded — it is Unix-only and unnecessary.
-- **smoltcp as TCP server**: smoltcp handles the TCP state machine for connections initiated by WireGuard peers. Real OS sockets handle the outbound side to internal hosts.
-- **NAT table keyed on 5-tuple**: uses the original dst (pre-rewrite). Two indices are maintained:
-  - `(proto, src_ip, src_port, dst_port)` → `original_dst_ip` — for smoltcp lookups (post-rewrite, original dst_ip is lost)
-  - `(proto, src_ip, src_port, original_dst_ip, dst_port)` → `(smoltcp_socket_handle, real_os_socket)` — full record
-  - Collision on the first index (same client, same dst_port, different dst_ip) is theoretically possible but negligible in practice.
-- **smoltcp on a dedicated thread**: smoltcp's API is pull-based (`poll()` loop), not async. It runs on its own thread and communicates with tokio tasks via channels.
-- **Connection lifecycle via smoltcp socket state**: smoltcp tracks TCP state (ESTABLISHED, CLOSE_WAIT, TIME_WAIT, CLOSED) for the tunnel-facing side. NAT table entries are not removed immediately on close — a 60-second expiry timer starts when smoltcp reports a socket has reached CLOSED/TIME_WAIT. A background task sweeps expired entries. If a new SYN arrives for an expiring entry and smoltcp confirms the old socket is done, a new smoltcp socket + OS socket pair is created and the entry is replaced. The OS-side TcpStream handles its own TIME_WAIT internally when dropped.
-- **PersistentKeepalive**: required to maintain the outbound NAT UDP mapping to the WireGuard server.
-- **WireGuard server does the routing**: standard AllowedIPs config, no custom routing logic needed on the gateway itself.
+## Key design decisions
 
-## Workflow Rules
+- **`boringtun` as pure protocol lib**: `noise::Tunn` only; its `device`
+  module (epoll/TUN/UAPI) is excluded.
+- **Tunn per peer**: `PeerTable` holds an `Arc<Peer>` per
+  `NodePublicKey`, each with its own `boringtun::Tunn`. The reconciler
+  (`src/peer_reconciler.rs`) keeps the table aligned with the Headscale
+  netmap.
+- **node_key == wg_public**: Tailscale's protocol uses the node public
+  key as the WireGuard peer public key. Our `wg_private` is
+  `NodeIdentity.state.node_keys.private` cast through raw bytes (ts_keys
+  rides on x25519-dalek 3.0-pre while boringtun pins 2.x, so the
+  blanket `From` impl doesn't resolve).
+- **NAT table keyed on 5-tuple** with two indices: one pre-rewrite
+  (`proto, src, dst_port` → `original_dst_ip`) and one full record
+  (full 5-tuple → smoltcp handle + OS socket). Collision on the first
+  index (same client, same dst_port, different dst_ip) is theoretically
+  possible but negligible.
+- **smoltcp on a dedicated thread**: smoltcp's API is pull-based, not
+  async. It runs on its own OS thread and communicates with tokio tasks
+  via channels.
+- **Connection lifecycle via smoltcp socket state**: 60s grace window
+  after CLOSED/TIME_WAIT, background sweeper. SYN-for-expiring entry
+  replaces the slot.
+- **DERP-only transport**: direct peer-to-peer (Tailscale's disco /
+  NAT-traversal magic) is explicitly out of scope. Everything relays.
 
-- **Commit regularly.** After feature additions, major code changes, and logical stopping points. Don't let large unrelated changes pile up in a single commit.
-- **Every code addition must be backed by appropriate tests.** Unit, integration, regression, or end-to-end — whichever fits. Don't ship a feature without a test (or an explicit note explaining why a layer is genuinely N/A, e.g. the code requires external infra that hasn't been authorised).
-- **Prefer Test-Driven Development.** Write the failing test, then the implementation. Strongest for pure library code (key types, protocol primitives, data structures); relaxed for I/O glue where test and code are entangled.
-- **Always format code before pushing.** `cargo fmt --all` at every push boundary. If edits landed without `cargo fmt`, fix before pushing.
-- **Update plan docs in place.** Burrow-headscale's implementation plan lives at `C:\Users\user\.claude\plans\system-reminder-you-re-running-in-functional-narwhal.md`. Edit it as decisions evolve. Do not flood the directory with new markdown files.
-- **Prompt before standing up E2E infrastructure.** End-to-end tests require external infrastructure (WireGuard server, Headscale + DERP, internal network targets). Ask before assuming infra exists or starting to provision it.
+## Workflow rules
+
+- **Commit regularly.** After feature additions, major code changes,
+  and logical stopping points. Don't let large unrelated changes pile
+  up in a single commit.
+- **Every code addition must be backed by appropriate tests** — unit,
+  integration, regression, or end-to-end. If a layer is genuinely N/A
+  (e.g. a binary's `main` wrapping already-tested library code, or a
+  feature needs external infra that hasn't been authorised), say so
+  explicitly rather than silently skipping.
+- **Prefer Test-Driven Development.** Write the failing test, then
+  the implementation. Strongest for pure library code; relaxed for
+  I/O glue.
+- **Format before pushing**, but scope the format to files you
+  touched. Use `rustfmt --edition 2021 <files>` or `cargo fmt -p
+  burrow`. Do NOT use `cargo fmt --all` — it walks into
+  `vendor/tailscale-rs/` and reformats upstream code, which we must
+  not modify.
+- **Update plan docs in place.** The implementation plan lives at
+  `C:\Users\user\.claude\plans\system-reminder-you-re-running-in-functional-narwhal.md`.
+  Edit as decisions evolve; don't flood the directory with new md
+  files.
+- **Prompt before standing up E2E infrastructure.** Integration tests
+  that need a real Headscale / DERP / LAN target require external
+  resources. Ask before assuming infra exists or provisioning it.
+
+## Build & test quick-reference
+
+- `cargo build` / `cargo test` — default build, Headscale + DERP
+  compile unconditionally (no feature flag since the Stage 2b/c commit).
+- `cargo test --features insecure-tests` — enables the real-DERP and
+  real-Headscale integration tests, which forward
+  `ts_transport_derp/insecure-for-tests` and
+  `ts_control/insecure-keyfetch` so a loopback tunnel with a
+  self-signed cert or plain HTTP works.
+- Integration tests that need infra:
+  - `tests/derp_real_roundtrip.rs` → needs `BURROW_TEST_DERP_URL`.
+  - `tests/headscale_register_roundtrip.rs` → needs
+    `BURROW_TEST_HEADSCALE_URL` + `BURROW_TEST_HEADSCALE_AUTHKEY`.
+  Both short-circuit cleanly without those vars so the suite stays
+  hermetic.
+
+The wg-quick transport path (`src/main.rs::run`, uses `--config`) is
+still present for the transition but will be retired in Stage 5 of the
+plan. New development should target the headscale path
+(`src/hs_main.rs`, selected when `--server-url` is given).
