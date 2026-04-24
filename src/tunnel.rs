@@ -49,6 +49,31 @@ impl WgCore {
         }
     }
 
+    /// Constructor for callers that don't have a wg-quick [`Config`] — used by
+    /// the Headscale fork's `Peer`, where each peer's Tunn is built from raw
+    /// keys supplied by a `MapResponse` plus the node's own private key.
+    /// Preshared keys aren't part of the Headscale data model, so callers that
+    /// don't use one pass `None`.
+    #[cfg(feature = "headscale")]
+    pub fn from_raw(
+        private_key: x25519_dalek::StaticSecret,
+        peer_public_key: x25519_dalek::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+    ) -> Self {
+        let tunn = Tunn::new(
+            private_key,
+            peer_public_key,
+            preshared_key,
+            persistent_keepalive,
+            0,
+            None,
+        );
+        Self {
+            tunn: Mutex::new(tunn),
+        }
+    }
+
     /// Build a handshake initiation message. `force_resend` corresponds to the
     /// boringtun parameter and forces a fresh handshake even if one is in flight.
     pub fn handshake_init(&self, force_resend: bool) -> Result<CoreStep> {

@@ -49,6 +49,20 @@ ts_control_noise  = { path = "vendor/tailscale-rs/ts_control_noise", optional = 
 ts_control_serde  = { path = "vendor/tailscale-rs/ts_control_serde", optional = true }
 ts_transport_derp = { path = "vendor/tailscale-rs/ts_transport_derp", optional = true }
 ts_keys           = { path = "vendor/tailscale-rs/ts_keys", optional = true }
+# `ts_packet::PacketMut` is the bytes-wrapper the DERP API wants on its send
+# path; we use it directly to avoid pulling the umbrella `tailscale` crate.
+ts_packet         = { path = "vendor/tailscale-rs/ts_packet", optional = true }
+
+# Lock-free hashmap. PeerTable indices are hot on every ingress and egress
+# packet, and the dispatch + send paths run concurrently with the netmap
+# reconciler; a `Mutex<HashMap>` would serialise them.
+dashmap           = { version = "6", optional = true }
+
+# Pulled in transitively already (via tokio_util, hyper, etc.) but we want
+# direct names at the crate boundary so the `DerpClient` wrapper stays
+# independent of which transitive dep's re-export we happen to use.
+bytes             = { version = "1", optional = true }
+url               = { version = "2", optional = true }
 
 [[bin]]
 name = "burrow"
@@ -87,6 +101,10 @@ headscale = [
     "dep:ts_control_serde",
     "dep:ts_transport_derp",
     "dep:ts_keys",
+    "dep:ts_packet",
+    "dep:dashmap",
+    "dep:bytes",
+    "dep:url",
 ]
 
 [target.'cfg(windows)'.dependencies]
