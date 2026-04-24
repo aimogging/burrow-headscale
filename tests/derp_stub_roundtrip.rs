@@ -95,34 +95,36 @@ async fn handshake_and_ipv4_data_round_trip_over_mem_derp() {
     let a_tailnet: Ipv4Addr = "100.64.0.1".parse().unwrap();
     let b_tailnet: Ipv4Addr = "100.64.0.2".parse().unwrap();
 
-    let a_wg_pub = PublicKey::from(&a.wg_private);
-    let b_wg_pub = PublicKey::from(&b.wg_private);
+    let a_wg_pub = PublicKey::from(&a.wg_private());
+    let b_wg_pub = PublicKey::from(&b.wg_private());
 
     // PeerTable on each side — small test but exercises the DashMap
     // path that Stage 3's ingress/egress dispatch will use.
     let a_peers = PeerTable::new();
     a_peers.insert(Peer::new(
-        b.node_key.public,
+        b.state.node_keys.public,
         b_wg_pub,
         b_tailnet,
-        a.wg_private.clone(),
+        a.wg_private(),
         None,
     ));
     let b_peers = PeerTable::new();
     b_peers.insert(Peer::new(
-        a.node_key.public,
+        a.state.node_keys.public,
         a_wg_pub,
         a_tailnet,
-        b.wg_private.clone(),
+        b.wg_private(),
         None,
     ));
 
     let derp = MemDerp::new();
-    let mut a_rx = derp.register(a.node_key.public).await;
-    let mut b_rx = derp.register(b.node_key.public).await;
+    let mut a_rx = derp.register(a.state.node_keys.public).await;
+    let mut b_rx = derp.register(b.state.node_keys.public).await;
 
     // --- Handshake init: A -> B ---
-    let a_peer_b = a_peers.by_node_key(&b.node_key.public).expect("a sees b");
+    let a_peer_b = a_peers
+        .by_node_key(&b.state.node_keys.public)
+        .expect("a sees b");
     let init_step = a_peer_b.core.handshake_init(false).expect("handshake init");
     assert_eq!(
         init_step.to_network.len(),
@@ -131,16 +133,18 @@ async fn handshake_and_ipv4_data_round_trip_over_mem_derp() {
     );
     let init_frame = relay_and_recv(
         &derp,
-        a.node_key.public,
-        b.node_key.public,
+        a.state.node_keys.public,
+        b.state.node_keys.public,
         init_step.to_network,
         &mut b_rx,
     )
     .await;
-    assert_eq!(init_frame.sender, a.node_key.public);
+    assert_eq!(init_frame.sender, a.state.node_keys.public);
 
     // --- Handshake response: B -> A ---
-    let b_peer_a = b_peers.by_node_key(&a.node_key.public).expect("b sees a");
+    let b_peer_a = b_peers
+        .by_node_key(&a.state.node_keys.public)
+        .expect("b sees a");
     let resp_step = b_peer_a
         .core
         .decapsulate(None, &init_frame.bytes)
@@ -155,13 +159,13 @@ async fn handshake_and_ipv4_data_round_trip_over_mem_derp() {
     );
     let resp_frame = relay_and_recv(
         &derp,
-        b.node_key.public,
-        a.node_key.public,
+        b.state.node_keys.public,
+        a.state.node_keys.public,
         resp_step.to_network,
         &mut a_rx,
     )
     .await;
-    assert_eq!(resp_frame.sender, b.node_key.public);
+    assert_eq!(resp_frame.sender, b.state.node_keys.public);
 
     let settle = a_peer_b
         .core
@@ -185,8 +189,8 @@ async fn handshake_and_ipv4_data_round_trip_over_mem_derp() {
     );
     let data_frame = relay_and_recv(
         &derp,
-        a.node_key.public,
-        b.node_key.public,
+        a.state.node_keys.public,
+        b.state.node_keys.public,
         enc_step.to_network,
         &mut b_rx,
     )
@@ -215,10 +219,14 @@ async fn frame_to_unregistered_node_is_dropped_silently() {
     let derp = MemDerp::new();
     let a = NodeIdentity::generate();
     let b = NodeIdentity::generate();
-    let mut a_rx = derp.register(a.node_key.public).await;
+    let mut a_rx = derp.register(a.state.node_keys.public).await;
 
-    derp.send(a.node_key.public, b.node_key.public, vec![1, 2, 3])
-        .await;
+    derp.send(
+        a.state.node_keys.public,
+        b.state.node_keys.public,
+        vec![1, 2, 3],
+    )
+    .await;
 
     // `a` should not see `b`'s traffic and there is no `b` inbox, so
     // `a`'s channel stays empty.

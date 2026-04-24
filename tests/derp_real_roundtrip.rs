@@ -141,9 +141,9 @@ async fn wireguard_handshake_init_round_trips_over_real_derp() {
     let b_ident = NodeIdentity::generate();
     let peer_of_b = Peer::new(
         b.public,
-        PublicKey::from(&b_ident.wg_private),
+        PublicKey::from(&b_ident.wg_private()),
         "100.64.0.2".parse().unwrap(),
-        a_ident.wg_private.clone(),
+        a_ident.wg_private(),
         None,
     );
 

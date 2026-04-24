@@ -1,96 +1,114 @@
 //! Per-process cryptographic identity for the headscale data plane.
 //!
-//! Three distinct X25519 keypairs are needed at once:
+//! Structurally a thin wrapper over [`ts_keys::NodeState`], which already
+//! bundles the four X25519 keypairs Tailscale uses (machine, node, disco,
+//! network lock). Burrow only needs three of those in play:
 //!
-//! - `wg_private` feeds `boringtun::noise::Tunn::new` on our side of every
-//!   peer relationship. It is identical across all `Peer`s we maintain in
-//!   `peer_table.rs`.
-//! - `disco_key` is kept for the Tailscale disco protocol (peer endpoint
-//!   negotiation). Stage 1-3 burrow doesn't use it on the wire, but we
-//!   materialise the key now so the shape of `NodeIdentity` is stable
-//!   across stages.
-//! - `node_key` authenticates us both to Headscale (Noise IK handshake in
-//!   `headscale.rs`) and to the DERP relay (handshake in
-//!   `ts_transport_derp::Client::handshake`).
+//! - `node_keys` — authenticates the control channel to Headscale (Noise
+//!   IK handshake) AND the DERP handshake AND identifies us as a WG peer.
+//!   Tailscale's on-wire protocol treats the node public key *as* the
+//!   WireGuard peer public key. Our `boringtun::Tunn` therefore uses
+//!   `node_keys.private` as its local static secret, and peer_table's
+//!   `wg_pub` for a given remote is that peer's `node_keys.public`.
+//! - `disco_keys` — reserved for the Tailscale disco protocol (peer
+//!   endpoint discovery for direct connections). Stage 1-3 burrow does
+//!   not exchange disco packets, but the key is materialised here so
+//!   registration with Headscale can advertise it.
+//! - `machine_keys` — hardware identity, used by the control-plane Noise
+//!   IK handshake. `ts_control::AsyncControlClient::connect` reads this
+//!   via the shared `NodeState`.
 //!
-//! Per the project constraint that nothing persists to disk, a fresh
-//! identity is minted on every process start. Callers are expected to
-//! treat `NodeIdentity` as owned state that lives for the lifetime of the
-//! runtime; clone the sub-fields if individual tasks need their own
-//! copies (e.g. each `Peer` takes a `StaticSecret::clone()` of the WG
-//! private).
+//! Nothing persists to disk (design constraint): `generate()` draws fresh
+//! material each boot.
 
 #![cfg(feature = "headscale")]
 
-use ts_keys::{DiscoKeyPair, NodeKeyPair};
-use x25519_dalek::StaticSecret;
+use ts_keys::NodeState;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NodeIdentity {
-    pub wg_private: StaticSecret,
-    pub disco_key: DiscoKeyPair,
-    pub node_key: NodeKeyPair,
+    pub state: NodeState,
 }
 
 impl NodeIdentity {
-    /// Generate a fresh identity. Each of the three keypairs is drawn
-    /// independently from the OS RNG via its own constructor; there is no
-    /// shared seed or derivation, so recovering one from another is not
-    /// possible.
+    /// Generate a fresh identity. Each of the four keypairs inside
+    /// `NodeState` draws independently from the OS RNG; nothing is
+    /// derived, nothing is persisted.
     pub fn generate() -> Self {
         Self {
-            wg_private: StaticSecret::random(),
-            disco_key: DiscoKeyPair::new(),
-            node_key: NodeKeyPair::new(),
+            state: NodeState::generate(),
         }
+    }
+
+    /// The WireGuard private key for this node. Callers typically clone
+    /// this per-peer since `boringtun::Tunn::new` takes ownership.
+    ///
+    /// Identical to `state.node_keys.private` — the distinction is for
+    /// documentation at call sites that reason in boringtun terms rather
+    /// than tailcfg terms.
+    ///
+    /// Going through `to_bytes()` is deliberate: boringtun and the
+    /// vendored `ts_keys` sit on different `x25519-dalek` versions
+    /// (2.x vs 3.0-pre), so the blanket `From<NodePrivateKey>` impl
+    /// wouldn't resolve to our `StaticSecret`. The raw scalar is the
+    /// same in both versions so the round-trip is lossless.
+    pub fn wg_private(&self) -> StaticSecret {
+        StaticSecret::from(self.state.node_keys.private.to_bytes())
+    }
+
+    /// Our WireGuard public key (= Tailscale node public key). Remote
+    /// peers addressing us in the tailnet use this same 32-byte value.
+    pub fn wg_public(&self) -> PublicKey {
+        PublicKey::from(&self.wg_private())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x25519_dalek::PublicKey;
 
-    /// Each of the three key materials must be byte-distinct from the
-    /// others within a single identity. If any two happen to match it
-    /// signals a construction bug — e.g. all three secretly sharing one
-    /// underlying key — far more than it signals a 2^-256 RNG collision.
+    /// `wg_public` must match the derived public of `node_keys.private`
+    /// — same key material by design. Separately, the disco key must
+    /// be independent of the node key; conflating them would let anyone
+    /// who observed a disco-protocol payload also forge WG traffic.
     #[test]
-    fn generate_produces_three_distinct_public_keys() {
+    fn generate_binds_wg_to_node_and_keeps_disco_distinct() {
         let ident = NodeIdentity::generate();
 
-        let wg_pub = PublicKey::from(&ident.wg_private).to_bytes();
-        let disco_pub: [u8; 32] = ident.disco_key.public.into();
-        let node_pub: [u8; 32] = ident.node_key.public.into();
+        let wg_pub = ident.wg_public().to_bytes();
+        let node_pub: [u8; 32] = ident.state.node_keys.public.into();
+        let disco_pub: [u8; 32] = ident.state.disco_keys.public.into();
 
-        assert_ne!(
-            wg_pub, disco_pub,
-            "wg_private derives to same public as disco_key"
-        );
-        assert_ne!(
+        assert_eq!(
             wg_pub, node_pub,
-            "wg_private derives to same public as node_key"
+            "wg pubkey equals node pubkey (Tailscale invariant)"
         );
-        assert_ne!(disco_pub, node_pub, "disco_key and node_key share a public");
+        assert_ne!(disco_pub, node_pub, "disco key is independent of node key");
     }
 
     /// Two successive invocations must produce independent identities.
-    /// If they match, either the RNG is seeded deterministically or
-    /// `generate` is caching — both are bugs.
+    /// Deterministic output would signal a seeded RNG or a cache bug.
     #[test]
     fn generate_is_non_deterministic() {
         let a = NodeIdentity::generate();
         let b = NodeIdentity::generate();
 
-        let a_wg = PublicKey::from(&a.wg_private).to_bytes();
-        let b_wg = PublicKey::from(&b.wg_private).to_bytes();
-        assert_ne!(a_wg, b_wg, "two calls produced the same wg_private");
+        let a_node: [u8; 32] = a.state.node_keys.public.into();
+        let b_node: [u8; 32] = b.state.node_keys.public.into();
+        assert_ne!(a_node, b_node, "two generates produced the same node key");
 
-        let a_disco: [u8; 32] = a.disco_key.public.into();
-        let b_disco: [u8; 32] = b.disco_key.public.into();
-        assert_ne!(a_disco, b_disco, "two calls produced the same disco_key");
+        let a_disco: [u8; 32] = a.state.disco_keys.public.into();
+        let b_disco: [u8; 32] = b.state.disco_keys.public.into();
+        assert_ne!(
+            a_disco, b_disco,
+            "two generates produced the same disco key"
+        );
 
-        let a_node: [u8; 32] = a.node_key.public.into();
-        let b_node: [u8; 32] = b.node_key.public.into();
-        assert_ne!(a_node, b_node, "two calls produced the same node_key");
+        let a_machine: [u8; 32] = a.state.machine_keys.public.into();
+        let b_machine: [u8; 32] = b.state.machine_keys.public.into();
+        assert_ne!(
+            a_machine, b_machine,
+            "two generates produced the same machine key"
+        );
     }
 }
