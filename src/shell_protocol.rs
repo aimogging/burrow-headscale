@@ -100,7 +100,10 @@ pub async fn read_frame<'a, R: AsyncRead + Unpin>(
             let v = i32::from_be_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
             Frame::Exit(v)
         }
-        _ => Frame::Unknown { tag, data: &scratch[..] },
+        _ => Frame::Unknown {
+            tag,
+            data: &scratch[..],
+        },
     })
 }
 

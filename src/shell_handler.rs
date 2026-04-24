@@ -324,11 +324,7 @@ async fn send_exit_and_close(smoltcp: &SmoltcpHandle, id: ConnectionId, status: 
 /// Push `data` through smoltcp's write-tcp pipe in full, retrying
 /// briefly on `Ok(0)` (buffer full). Gives up after 500 iterations
 /// (~1 s) to avoid wedging the interactive session on a broken flow.
-async fn write_all_tcp(
-    smoltcp: &SmoltcpHandle,
-    id: ConnectionId,
-    data: &[u8],
-) -> Result<(), ()> {
+async fn write_all_tcp(smoltcp: &SmoltcpHandle, id: ConnectionId, data: &[u8]) -> Result<(), ()> {
     let mut remaining = data;
     for _ in 0..500 {
         if remaining.is_empty() {

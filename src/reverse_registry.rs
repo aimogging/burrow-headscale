@@ -146,11 +146,7 @@ impl ReverseRegistry {
         let inner = self.inner.lock().unwrap();
         // Try Default (resolved to wg_ip) first, then Any, then
         // explicit Ipv4 match.
-        for candidate_bind in [
-            BindAddr::Default,
-            BindAddr::Any,
-            BindAddr::Ipv4(dst_ip),
-        ] {
+        for candidate_bind in [BindAddr::Default, BindAddr::Any, BindAddr::Ipv4(dst_ip)] {
             if let Some(entry) = inner.by_key.get(&(proto, listen_port, candidate_bind)) {
                 let matches = match candidate_bind {
                     BindAddr::Default => dst_ip == wg_ip,
@@ -220,8 +216,14 @@ mod tests {
     #[test]
     fn default_bind_only_matches_wg_ip() {
         let reg = ReverseRegistry::new();
-        reg.start(Proto::Tcp, 22, BindAddr::Default, "h:22".into(), dummy_opener())
-            .unwrap();
+        reg.start(
+            Proto::Tcp,
+            22,
+            BindAddr::Default,
+            "h:22".into(),
+            dummy_opener(),
+        )
+        .unwrap();
         let wg_ip = Ipv4Addr::new(10, 0, 0, 2);
         assert!(reg.lookup(Proto::Tcp, wg_ip, 22, wg_ip).is_some());
         // Different dst → no match.
@@ -261,8 +263,14 @@ mod tests {
     #[test]
     fn port_collision_rejected() {
         let reg = ReverseRegistry::new();
-        reg.start(Proto::Tcp, 443, BindAddr::Default, "h:443".into(), dummy_opener())
-            .unwrap();
+        reg.start(
+            Proto::Tcp,
+            443,
+            BindAddr::Default,
+            "h:443".into(),
+            dummy_opener(),
+        )
+        .unwrap();
         let err = reg.start(
             Proto::Tcp,
             443,
@@ -333,10 +341,22 @@ mod tests {
     fn tunnel_ids_unique() {
         let reg = ReverseRegistry::new();
         let a = reg
-            .start(Proto::Tcp, 1, BindAddr::Default, "h:1".into(), dummy_opener())
+            .start(
+                Proto::Tcp,
+                1,
+                BindAddr::Default,
+                "h:1".into(),
+                dummy_opener(),
+            )
             .unwrap();
         let b = reg
-            .start(Proto::Tcp, 2, BindAddr::Default, "h:2".into(), dummy_opener())
+            .start(
+                Proto::Tcp,
+                2,
+                BindAddr::Default,
+                "h:2".into(),
+                dummy_opener(),
+            )
             .unwrap();
         assert_ne!(a, b);
     }

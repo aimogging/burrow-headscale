@@ -252,10 +252,7 @@ impl Keypair {
 
 /// Lay out `.1` for the server, `.2` for the gateway, and `.10..` for
 /// clients within the subnet. Errors if the subnet can't fit them all.
-fn allocate_ips(
-    subnet: &Ipv4Cidr,
-    clients: u16,
-) -> Result<(Ipv4Addr, Ipv4Addr, Vec<Ipv4Addr>)> {
+fn allocate_ips(subnet: &Ipv4Cidr, clients: u16) -> Result<(Ipv4Addr, Ipv4Addr, Vec<Ipv4Addr>)> {
     let network = subnet.network().address();
     let prefix = subnet.prefix_len();
     let host_bits = 32 - prefix;
@@ -389,10 +386,10 @@ mod tests {
         let (server, gateway, clients) = allocate_ips(&subnet, 2).unwrap();
         assert_eq!(server, Ipv4Addr::new(10, 50, 0, 1));
         assert_eq!(gateway, Ipv4Addr::new(10, 50, 0, 2));
-        assert_eq!(clients, vec![
-            Ipv4Addr::new(10, 50, 0, 10),
-            Ipv4Addr::new(10, 50, 0, 11),
-        ]);
+        assert_eq!(
+            clients,
+            vec![Ipv4Addr::new(10, 50, 0, 10), Ipv4Addr::new(10, 50, 0, 11),]
+        );
     }
 
     #[test]
@@ -449,7 +446,9 @@ mod tests {
         let out = generate(&p).unwrap();
         let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
         assert!(
-            client.contents.contains("DNS = 10.0.0.2, 1.1.1.1, 9.9.9.9\n"),
+            client
+                .contents
+                .contains("DNS = 10.0.0.2, 1.1.1.1, 9.9.9.9\n"),
             "expected comma-joined DNS list, got:\n{}",
             client.contents
         );

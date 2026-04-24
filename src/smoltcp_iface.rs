@@ -82,21 +82,22 @@ impl phy::Device for ChannelDevice {
     where
         Self: 'a;
 
-    fn receive(
-        &mut self,
-        _ts: SmolInstant,
-    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.rx.try_recv() {
             Ok(buf) => Some((
                 ChannelRxToken { buffer: buf },
-                ChannelTxToken { tx: self.tx.clone() },
+                ChannelTxToken {
+                    tx: self.tx.clone(),
+                },
             )),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(ChannelTxToken { tx: self.tx.clone() })
+        Some(ChannelTxToken {
+            tx: self.tx.clone(),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

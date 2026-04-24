@@ -70,12 +70,7 @@ pub fn build_tcp(
 
 /// Convenience: SYN-only packet with seq=1000 (matches the value the
 /// pre-refactor hand-rolled helpers used). No payload, ack=0.
-pub fn build_tcp_syn(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-) -> Vec<u8> {
+pub fn build_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
     build_tcp(src, dst, src_port, dst_port, 1000, 0, SYN, &[])
 }
 

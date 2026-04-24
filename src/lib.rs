@@ -23,4 +23,5 @@ pub mod derp;
 pub mod headscale;
 pub mod hs_main;
 pub mod node_identity;
+pub mod peer_reconciler;
 pub mod peer_table;

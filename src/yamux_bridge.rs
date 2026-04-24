@@ -84,9 +84,7 @@ pub fn smoltcp_as_duplex(
                             break;
                         }
                         match smoltcp_for_b.write_tcp(id, remaining.to_vec()).await {
-                            Ok(0) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(2)).await
-                            }
+                            Ok(0) => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
                             Ok(n) => remaining = &remaining[n..],
                             Err(_) => return,
                         }
@@ -220,9 +218,7 @@ pub mod udp_frame {
         Ok(())
     }
 
-    pub async fn read<R: AsyncRead + Unpin>(
-        r: &mut R,
-    ) -> io::Result<(Ipv4Addr, u16, Vec<u8>)> {
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(Ipv4Addr, u16, Vec<u8>)> {
         let mut hdr = [0u8; 4 + 4 + 2];
         r.read_exact(&mut hdr).await?;
         let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
@@ -249,7 +245,9 @@ pub mod udp_frame {
         #[tokio::test]
         async fn roundtrip() {
             let (mut a, mut b) = duplex(4096);
-            write(&mut a, Ipv4Addr::new(10, 0, 0, 1), 5353, b"hi").await.unwrap();
+            write(&mut a, Ipv4Addr::new(10, 0, 0, 1), 5353, b"hi")
+                .await
+                .unwrap();
             let (ip, port, payload) = read(&mut b).await.unwrap();
             assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 1));
             assert_eq!(port, 5353);
@@ -259,7 +257,9 @@ pub mod udp_frame {
         #[tokio::test]
         async fn empty_payload_roundtrip() {
             let (mut a, mut b) = duplex(64);
-            write(&mut a, Ipv4Addr::new(1, 2, 3, 4), 9, &[]).await.unwrap();
+            write(&mut a, Ipv4Addr::new(1, 2, 3, 4), 9, &[])
+                .await
+                .unwrap();
             let (_, _, payload) = read(&mut b).await.unwrap();
             assert!(payload.is_empty());
         }

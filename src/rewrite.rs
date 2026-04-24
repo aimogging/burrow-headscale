@@ -31,8 +31,7 @@ fn require_ipv4(packet: &[u8]) -> Result<()> {
     if Ipv4Packet::new_unchecked(packet).version() != 4 {
         bail!("not an IPv4 packet");
     }
-    Ipv4Packet::new_checked(packet)
-        .map_err(|_| anyhow!("packet too short for IPv4 header"))?;
+    Ipv4Packet::new_checked(packet).map_err(|_| anyhow!("packet too short for IPv4 header"))?;
     Ok(())
 }
 
@@ -315,7 +314,10 @@ mod tests {
     fn tcp_checksum_ok(pkt: &[u8]) -> bool {
         let ip = Ipv4Packet::new_checked(pkt).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-        tcp.verify_checksum(&IpAddress::Ipv4(ip.src_addr()), &IpAddress::Ipv4(ip.dst_addr()))
+        tcp.verify_checksum(
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr()),
+        )
     }
 
     #[test]
@@ -427,7 +429,10 @@ mod tests {
         let ip = Ipv4Packet::new_checked(&pkt[..]).unwrap();
         let udp = UdpPacket::new_checked(ip.payload()).unwrap();
         assert_ne!(udp.checksum(), 0);
-        assert!(udp.verify_checksum(&IpAddress::Ipv4(ip.src_addr()), &IpAddress::Ipv4(ip.dst_addr())));
+        assert!(udp.verify_checksum(
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr())
+        ));
     }
 
     #[test]

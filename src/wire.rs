@@ -146,7 +146,9 @@ pub enum ClientReq {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerResp {
-    Started { tunnel_id: TunnelId },
+    Started {
+        tunnel_id: TunnelId,
+    },
     Stopped,
     ReverseList(Vec<ReverseEntry>),
     /// Response for `ShellMode::Oneshot`. `exit_code` is `None` if the
@@ -158,12 +160,17 @@ pub enum ServerResp {
         stderr: Vec<u8>,
     },
     /// Response for `ShellMode::FireAndForget`.
-    ShellSpawned { pid: u32 },
+    ShellSpawned {
+        pid: u32,
+    },
     /// Response for `ShellMode::Interactive` (Phase 17). After
     /// sending, the server switches the flow into a framed stdio
     /// protocol for the session lifetime.
     ShellReady,
-    Error { kind: ErrorKind, msg: String },
+    Error {
+        kind: ErrorKind,
+        msg: String,
+    },
 }
 
 /// Read one length-prefixed CBOR frame. Returns `Err(io::ErrorKind::UnexpectedEof)`

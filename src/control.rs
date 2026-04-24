@@ -31,7 +31,9 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::nat::NatKey;
 use crate::proxy::ProxyMsg;
-use crate::reverse_registry::{OpenRequest, ReverseRegistry, StartError, StopError, SubstreamOpener};
+use crate::reverse_registry::{
+    OpenRequest, ReverseRegistry, StartError, StopError, SubstreamOpener,
+};
 use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
 use crate::shell_handler::{handle_shell_request, run_interactive};
@@ -160,9 +162,11 @@ async fn handle_request(req: ClientReq, registry: &ReverseRegistry) -> ServerRes
             },
         },
         ClientReq::ListReverse => ServerResp::ReverseList(registry.list()),
-        ClientReq::RequestShell { mode, program, args } => {
-            handle_shell_request(mode, program, args).await
-        }
+        ClientReq::RequestShell {
+            mode,
+            program,
+            args,
+        } => handle_shell_request(mode, program, args).await,
     }
 }
 
@@ -218,13 +222,7 @@ async fn start_tunnel(
                     std::io::ErrorKind::AddrNotAvailable => ErrorKind::InvalidRequest,
                     _ => ErrorKind::Internal,
                 };
-                send_error(
-                    &smoltcp,
-                    id,
-                    kind,
-                    format!("tcp bind {bind_sock}: {e}"),
-                )
-                .await;
+                send_error(&smoltcp, id, kind, format!("tcp bind {bind_sock}: {e}")).await;
                 smoltcp.close_tcp(id);
                 return;
             }
@@ -237,13 +235,7 @@ async fn start_tunnel(
                     std::io::ErrorKind::AddrNotAvailable => ErrorKind::InvalidRequest,
                     _ => ErrorKind::Internal,
                 };
-                send_error(
-                    &smoltcp,
-                    id,
-                    kind,
-                    format!("udp bind {bind_sock}: {e}"),
-                )
-                .await;
+                send_error(&smoltcp, id, kind, format!("udp bind {bind_sock}: {e}")).await;
                 smoltcp.close_tcp(id);
                 return;
             }
@@ -354,11 +346,13 @@ async fn udp_accept_loop(socket: UdpSocket, opener: SubstreamOpener) {
 
     // Writer side: frames emitted into this channel are serialized and
     // written to the yamux substream.
-    let (frame_tx, mut frame_rx) =
-        mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
     let writer = tokio::spawn(async move {
         while let Some((ip, port, payload)) = frame_rx.recv().await {
-            if udp_frame::write(&mut y_w, ip, port, &payload).await.is_err() {
+            if udp_frame::write(&mut y_w, ip, port, &payload)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -471,7 +465,10 @@ async fn write_resp(smoltcp: &SmoltcpHandle, id: ConnectionId, resp: &ServerResp
         }
     }
     if !remaining.is_empty() {
-        tracing::warn!(?id, "control resp: gave up writing after repeated buffer-full");
+        tracing::warn!(
+            ?id,
+            "control resp: gave up writing after repeated buffer-full"
+        );
     }
 }
 

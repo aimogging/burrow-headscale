@@ -79,7 +79,10 @@ impl fmt::Debug for PeerConfig {
             .field("endpoint", &self.endpoint)
             .field("allowed_ips", &self.allowed_ips)
             .field("persistent_keepalive", &self.persistent_keepalive)
-            .field("preshared_key", &self.preshared_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -131,9 +134,7 @@ pub fn parse_str(input: &str) -> Result<Config> {
                 "peer" => {
                     peer_count += 1;
                     if peer_count > 1 {
-                        bail!(
-                            "line {lineno}: only a single [Peer] is supported in this version"
-                        );
+                        bail!("line {lineno}: only a single [Peer] is supported in this version");
                     }
                     section = Section::Peer;
                 }
@@ -141,8 +142,8 @@ pub fn parse_str(input: &str) -> Result<Config> {
             }
             continue;
         }
-        let (key, value) = parse_kv(line)
-            .with_context(|| format!("line {lineno}: expected `Key = Value`"))?;
+        let (key, value) =
+            parse_kv(line).with_context(|| format!("line {lineno}: expected `Key = Value`"))?;
         match section {
             Section::None => {
                 bail!("line {lineno}: key/value `{key}` outside of any section")
@@ -221,8 +222,8 @@ fn apply_interface_kv(
             builder.private_key = Some(StaticSecret::from(bytes));
         }
         "address" => {
-            let cidr =
-                parse_ipv4_cidr(value).with_context(|| format!("line {lineno}: invalid Address"))?;
+            let cidr = parse_ipv4_cidr(value)
+                .with_context(|| format!("line {lineno}: invalid Address"))?;
             builder.address = Some(cidr);
         }
         "controlport" => {
@@ -254,16 +255,11 @@ fn apply_interface_kv(
     Ok(())
 }
 
-fn apply_peer_kv(
-    builder: &mut PeerBuilder,
-    key: &str,
-    value: &str,
-    lineno: usize,
-) -> Result<()> {
+fn apply_peer_kv(builder: &mut PeerBuilder, key: &str, value: &str, lineno: usize) -> Result<()> {
     match key.to_ascii_lowercase().as_str() {
         "publickey" => {
-            let bytes = decode_key32(value)
-                .with_context(|| format!("line {lineno}: invalid PublicKey"))?;
+            let bytes =
+                decode_key32(value).with_context(|| format!("line {lineno}: invalid PublicKey"))?;
             builder.public_key = Some(PublicKey::from(bytes));
         }
         "endpoint" => {
@@ -310,7 +306,10 @@ fn decode_key32(value: &str) -> Result<[u8; 32]> {
         .decode(value.trim())
         .context("base64 decode failed")?;
     if decoded.len() != 32 {
-        bail!("expected 32 bytes after base64 decode, got {}", decoded.len());
+        bail!(
+            "expected 32 bytes after base64 decode, got {}",
+            decoded.len()
+        );
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&decoded);
@@ -424,7 +423,9 @@ mod tests {
         let err = parse_str(cfg).expect_err("must reject invalid base64");
         assert!(
             err.to_string().to_lowercase().contains("base64")
-                || err.chain().any(|e| e.to_string().to_lowercase().contains("base64"))
+                || err
+                    .chain()
+                    .any(|e| e.to_string().to_lowercase().contains("base64"))
         );
     }
 

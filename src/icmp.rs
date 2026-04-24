@@ -298,15 +298,20 @@ pub fn build_echo_reply_for_wg_ip(packet: &[u8], wg_ip: Ipv4Addr) -> Option<Vec<
     let checksum = ChecksumCapabilities::default();
     let icmp = Icmpv4Packet::new_checked(ip.payload()).ok()?;
     let (ident, seq_no, data) = match Icmpv4Repr::parse(&icmp, &checksum).ok()? {
-        Icmpv4Repr::EchoRequest { ident, seq_no, data } => (ident, seq_no, data),
+        Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        } => (ident, seq_no, data),
         _ => return None,
     };
-    let reply = Icmpv4Repr::EchoReply { ident, seq_no, data };
+    let reply = Icmpv4Repr::EchoReply {
+        ident,
+        seq_no,
+        data,
+    };
     let mut icmp_bytes = vec![0u8; reply.buffer_len()];
-    reply.emit(
-        &mut Icmpv4Packet::new_unchecked(&mut icmp_bytes),
-        &checksum,
-    );
+    reply.emit(&mut Icmpv4Packet::new_unchecked(&mut icmp_bytes), &checksum);
     Some(build_icmp_packet(wg_ip, ip.src_addr().into(), &icmp_bytes))
 }
 
@@ -355,7 +360,13 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    fn build_echo_request(peer: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    fn build_echo_request(
+        peer: Ipv4Addr,
+        dst: Ipv4Addr,
+        id: u16,
+        seq: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let icmp_len = 8 + payload.len();
         let total = 20 + icmp_len;
         let mut pkt = vec![0u8; total];

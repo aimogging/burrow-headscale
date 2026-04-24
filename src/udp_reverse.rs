@@ -31,13 +31,7 @@ pub async fn dispatch_udp_to_wg_ip(
     };
     if dns_enabled && view.dst_port == DNS_PORT {
         if let Some(resp) = handle_query(&payload).await {
-            let out = build_udp_packet(
-                wg_ip,
-                view.src_ip,
-                DNS_PORT,
-                view.src_port,
-                &resp.payload,
-            );
+            let out = build_udp_packet(wg_ip, view.src_ip, DNS_PORT, view.src_port, &resp.payload);
             let _ = egress_tx.send(out);
             return;
         }

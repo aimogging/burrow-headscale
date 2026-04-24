@@ -395,10 +395,9 @@ fn run_smoltcp_thread(
                     send_evt(SmoltcpEvent::TcpFinFromPeer { key, id });
                 }
 
-                let went_back_to_listen = matches!(
-                    prev,
-                    Some(tcp::State::SynReceived | tcp::State::SynSent)
-                ) && matches!(new_state, tcp::State::Listen);
+                let went_back_to_listen =
+                    matches!(prev, Some(tcp::State::SynReceived | tcp::State::SynSent))
+                        && matches!(new_state, tcp::State::Listen);
                 let closed_now = matches!(new_state, tcp::State::Closed);
                 if (went_back_to_listen || closed_now) && !ever_established.contains(&id) {
                     tracing::debug!(
@@ -608,7 +607,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_emits_synack_for_listened_port() {
         let nat = Arc::new(NatTable::new());
-        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), Ipv4Addr::new(10, 0, 0, 2));
+        let (handle, _events, mut tx_rx) =
+            spawn_smoltcp(Arc::clone(&nat), Ipv4Addr::new(10, 0, 0, 2));
 
         let mut syn = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 1),

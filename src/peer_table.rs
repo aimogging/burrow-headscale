@@ -117,6 +117,73 @@ impl PeerTable {
         self.by_node_key.is_empty()
     }
 
+    /// Bring the table in line with a desired peer set, typically drawn
+    /// from [`crate::headscale::ControlState::peers`].
+    ///
+    /// - peers in `want` that aren't in the table are constructed via
+    ///   [`Peer::new`] with a clone of the node's own WG private key
+    ///   and inserted.
+    /// - peers in the table whose node key is absent from `want` are
+    ///   removed. Dropping the evicted `Arc<Peer>` frees that `Tunn`'s
+    ///   pending encrypt/decrypt queues; no explicit teardown needed
+    ///   because boringtun holds no I/O resources.
+    /// - peers whose tailnet IPv4 changed in `want` are replaced in
+    ///   full (a new `Peer`, which means a fresh `Tunn`). The previous
+    ///   encryption session is discarded, which forces a re-handshake
+    ///   on the next data packet. This is the rare path — Tailscale
+    ///   does not normally re-address nodes.
+    ///
+    /// The `keepalive` argument is forwarded to every newly-constructed
+    /// `Peer`. `None` means "no persistent keepalive" — a typical
+    /// Headscale deployment doesn't need one because DERP itself keeps
+    /// the TCP connection warm.
+    pub fn reconcile(
+        &self,
+        want: &[crate::headscale::PeerInfo],
+        ident: &crate::node_identity::NodeIdentity,
+        keepalive: Option<u16>,
+    ) {
+        use std::collections::HashSet;
+
+        // Build the desired key set once.
+        let want_keys: HashSet<NodePublicKey> = want.iter().map(|p| p.node_key).collect();
+
+        // Step 1: evict peers that are no longer wanted.
+        let doomed: Vec<NodePublicKey> = self
+            .by_node_key
+            .iter()
+            .filter_map(|entry| {
+                let k = *entry.key();
+                (!want_keys.contains(&k)).then_some(k)
+            })
+            .collect();
+        for k in doomed {
+            self.remove(&k);
+        }
+
+        // Step 2: upsert the wanted set. `insert` is idempotent on the
+        // node_key path; we only pay the `Peer::new` cost when we
+        // actually need a new Tunn.
+        for info in want {
+            let existing = self.by_node_key.get(&info.node_key).map(|e| Arc::clone(&e));
+            match existing {
+                Some(prev) if prev.tailnet_ip == info.tailnet_ipv4 => {
+                    // Same identity, same IP — nothing to do.
+                }
+                _ => {
+                    let wg_pub = x25519_dalek::PublicKey::from(info.node_key.to_bytes());
+                    self.insert(Peer::new(
+                        info.node_key,
+                        wg_pub,
+                        info.tailnet_ipv4,
+                        ident.wg_private(),
+                        keepalive,
+                    ));
+                }
+            }
+        }
+    }
+
     /// Iterate all peers. Used by the 250ms timer tick to drive each
     /// `Tunn`'s keepalive/retransmit state. The `DashMap` shard locks
     /// are released between invocations of `f` so concurrent ingress
@@ -206,5 +273,95 @@ mod tests {
         let mut count = 0;
         table.for_each(|_| count += 1);
         assert_eq!(count, 5);
+    }
+
+    fn mk_info(byte: u8, ip: [u8; 4]) -> crate::headscale::PeerInfo {
+        crate::headscale::PeerInfo {
+            node_id: byte as i64,
+            node_key: mk_node_key(byte),
+            disco_key: None,
+            tailnet_ipv4: Ipv4Addr::from(ip),
+            hostname: format!("peer-{byte}"),
+            home_region: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_adds_missing_peers() {
+        let table = PeerTable::new();
+        let ident = crate::node_identity::NodeIdentity::generate();
+        table.reconcile(
+            &[
+                mk_info(0xa0, [100, 64, 0, 10]),
+                mk_info(0xa1, [100, 64, 0, 11]),
+            ],
+            &ident,
+            None,
+        );
+        assert_eq!(table.len(), 2);
+        assert!(table.by_node_key(&mk_node_key(0xa0)).is_some());
+        assert!(table
+            .by_tailnet_ip(&"100.64.0.11".parse().unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn reconcile_evicts_peers_absent_from_desired_set() {
+        let table = PeerTable::new();
+        let ident = crate::node_identity::NodeIdentity::generate();
+        // Seed with three peers.
+        table.reconcile(
+            &[
+                mk_info(0xb0, [100, 64, 0, 20]),
+                mk_info(0xb1, [100, 64, 0, 21]),
+                mk_info(0xb2, [100, 64, 0, 22]),
+            ],
+            &ident,
+            None,
+        );
+        assert_eq!(table.len(), 3);
+        // Reconcile down to one.
+        table.reconcile(&[mk_info(0xb1, [100, 64, 0, 21])], &ident, None);
+        assert_eq!(table.len(), 1);
+        assert!(table.by_node_key(&mk_node_key(0xb0)).is_none());
+        assert!(table.by_node_key(&mk_node_key(0xb1)).is_some());
+        assert!(table.by_node_key(&mk_node_key(0xb2)).is_none());
+    }
+
+    #[test]
+    fn reconcile_replaces_peer_whose_tailnet_ip_changed() {
+        let table = PeerTable::new();
+        let ident = crate::node_identity::NodeIdentity::generate();
+        table.reconcile(&[mk_info(0xc0, [100, 64, 0, 30])], &ident, None);
+        let original = table.by_node_key(&mk_node_key(0xc0)).unwrap();
+
+        table.reconcile(&[mk_info(0xc0, [100, 64, 0, 99])], &ident, None);
+        assert!(table
+            .by_tailnet_ip(&"100.64.0.30".parse().unwrap())
+            .is_none());
+        let replaced = table.by_node_key(&mk_node_key(0xc0)).unwrap();
+        assert_eq!(
+            replaced.tailnet_ip,
+            "100.64.0.99".parse::<Ipv4Addr>().unwrap()
+        );
+        // The new Peer is a fresh construction (not the same Arc).
+        assert!(!Arc::ptr_eq(&original, &replaced));
+    }
+
+    #[test]
+    fn reconcile_is_stable_on_identical_repeats() {
+        let table = PeerTable::new();
+        let ident = crate::node_identity::NodeIdentity::generate();
+        let set = vec![mk_info(0xd0, [100, 64, 0, 40])];
+        table.reconcile(&set, &ident, None);
+        let first = table.by_node_key(&mk_node_key(0xd0)).unwrap();
+
+        // Second reconcile with an identical set must not rebuild the
+        // Peer — if it did, we'd throw away an established Tunn
+        // session on every netmap delta. Arc pointer equality is the
+        // strongest signal that no replacement happened.
+        table.reconcile(&set, &ident, None);
+        let second = table.by_node_key(&mk_node_key(0xd0)).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

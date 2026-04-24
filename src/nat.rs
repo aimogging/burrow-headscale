@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 
 use crate::rewrite::{
-    parse_5tuple, rewrite_dst_ip, rewrite_dst_port, rewrite_src_ip, rewrite_src_port,
-    PROTO_TCP, PROTO_UDP,
+    parse_5tuple, rewrite_dst_ip, rewrite_dst_port, rewrite_src_ip, rewrite_src_port, PROTO_TCP,
+    PROTO_UDP,
 };
 use crate::runtime::ConnectionId;
 
@@ -456,7 +456,11 @@ fn clamp_port(p: u16) -> u16 {
 /// Advance (vip, port) by one slot, wrapping at the pool boundaries.
 fn advance(vip: u32, port: u16) -> (u32, u16) {
     if port == PORT_MAX {
-        let next_vip = if vip == VIP_MAX_U32 { VIP_MIN_U32 } else { vip + 1 };
+        let next_vip = if vip == VIP_MAX_U32 {
+            VIP_MIN_U32
+        } else {
+            vip + 1
+        };
         (next_vip, PORT_MIN)
     } else {
         (vip, port + 1)
@@ -475,7 +479,9 @@ fn evict(inner: &mut NatInner, key: NatKey) {
         if inner.by_gateway.get(&kgw) == Some(&key) {
             inner.by_gateway.remove(&kgw);
         }
-        inner.allocated.remove(&(entry.virtual_ip, entry.gateway_port));
+        inner
+            .allocated
+            .remove(&(entry.virtual_ip, entry.gateway_port));
     }
 }
 
@@ -532,12 +538,7 @@ mod tests {
         let (_, vip, gw) = table.rewrite_inbound(&mut ing).unwrap();
 
         // smoltcp would emit (src=vip:gw, dst=10.0.0.1:54321)
-        let mut eg = build_tcp_syn(
-            vip,
-            Ipv4Addr::new(10, 0, 0, 1),
-            gw,
-            54321,
-        );
+        let mut eg = build_tcp_syn(vip, Ipv4Addr::new(10, 0, 0, 1), gw, 54321);
         let key = table.rewrite_outbound(&mut eg).unwrap();
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
         assert_eq!(key.original_dst_port, 80);
@@ -639,11 +640,17 @@ mod tests {
             original_dst_ip: Ipv4Addr::new(192, 168, 1, 50),
             original_dst_port: 80,
         };
-        let (vip, gw) = table.try_reserve_pending(key).unwrap().expect("first reserve");
+        let (vip, gw) = table
+            .try_reserve_pending(key)
+            .unwrap()
+            .expect("first reserve");
         assert!(vip_in_pool(vip));
         assert!((PORT_MIN..=PORT_MAX).contains(&gw));
         let second = table.try_reserve_pending(key).unwrap();
-        assert!(second.is_none(), "second reserve on same key must be a no-op");
+        assert!(
+            second.is_none(),
+            "second reserve on same key must be a no-op"
+        );
         assert_eq!(table.len(), 1);
     }
 
@@ -683,12 +690,7 @@ mod tests {
     #[test]
     fn outbound_without_entry_errors() {
         let table = NatTable::new();
-        let mut eg = build_tcp_syn(
-            VIRTUAL_IFACE_ADDR,
-            Ipv4Addr::new(10, 0, 0, 1),
-            80,
-            54321,
-        );
+        let mut eg = build_tcp_syn(VIRTUAL_IFACE_ADDR, Ipv4Addr::new(10, 0, 0, 1), 80, 54321);
         let err = table.rewrite_outbound(&mut eg).unwrap_err();
         assert!(err.to_string().contains("no NAT entry"));
     }
