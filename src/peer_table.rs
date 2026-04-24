@@ -7,8 +7,6 @@
 //! Stage 1a skeleton: struct + basic CRUD. Dispatch integration lands
 //! in Stage 3 when the netmap reconciler drives `reconcile()`.
 
-#![cfg(feature = "headscale")]
-
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 

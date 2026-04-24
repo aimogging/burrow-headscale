@@ -19,11 +19,8 @@ pub mod udp_reverse;
 pub mod wire;
 pub mod yamux_bridge;
 
-#[cfg(feature = "headscale")]
 pub mod derp;
-#[cfg(feature = "headscale")]
 pub mod headscale;
-#[cfg(feature = "headscale")]
+pub mod hs_main;
 pub mod node_identity;
-#[cfg(feature = "headscale")]
 pub mod peer_table;

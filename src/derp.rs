@@ -16,8 +16,6 @@
 //!   `PeerTable`), so a broadcast channel would add overhead without
 //!   a use case.
 
-#![cfg(feature = "headscale")]
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -113,6 +111,7 @@ fn packet_to_bytes(packet: PacketMut) -> Bytes {
 /// from Headscale's `DerpMap` with full TLS-validation settings.
 pub fn server_conn_info_from_url(url: &str) -> Result<ServerConnInfo> {
     let parsed = url::Url::parse(url).with_context(|| format!("parse derp url {url}"))?;
-    ServerConnInfo::default_from_url(&parsed)
-        .context("URL doesn't match ts_transport_derp's default-from-URL heuristics (must be https)")
+    ServerConnInfo::default_from_url(&parsed).context(
+        "URL doesn't match ts_transport_derp's default-from-URL heuristics (must be https)",
+    )
 }

@@ -23,8 +23,6 @@
 //!   `DashMap<NodePublicKey, Arc<Peer>>` on top of it via
 //!   `PeerTable::reconcile`.
 
-#![cfg(feature = "headscale")]
-
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 

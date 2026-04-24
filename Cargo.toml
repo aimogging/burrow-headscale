@@ -10,7 +10,7 @@ default-run = "burrow"
 
 [dependencies]
 boringtun = "0.7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "io-std", "fs", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -39,36 +39,31 @@ portable-pty = { package = "portable-pty-psmux", version = "0.9" }
 # Client-side raw terminal + window-resize events.
 crossterm = "0.28"
 
-# --- Headscale fork (Stage 0 scaffolding; gated behind `headscale` feature) ---
-# The upstream layout keeps crates at the workspace root, not in a `crates/`
-# subdir, so paths are `vendor/tailscale-rs/ts_*` rather than
-# `vendor/tailscale-rs/crates/ts_*` as the original plan assumed.
-# See `vendor/tailscale-rs/REVISION` for the pinned commit.
-ts_control        = { path = "vendor/tailscale-rs/ts_control", optional = true }
-ts_control_noise  = { path = "vendor/tailscale-rs/ts_control_noise", optional = true }
-ts_control_serde  = { path = "vendor/tailscale-rs/ts_control_serde", optional = true }
-ts_transport_derp = { path = "vendor/tailscale-rs/ts_transport_derp", optional = true }
-ts_keys           = { path = "vendor/tailscale-rs/ts_keys", optional = true }
+# Vendored tailscale-rs crates (see vendor/tailscale-rs/REVISION for the
+# pinned upstream commit). Paths follow upstream's flat workspace
+# layout, not a `crates/` subdir.
+ts_control        = { path = "vendor/tailscale-rs/ts_control" }
+ts_control_noise  = { path = "vendor/tailscale-rs/ts_control_noise" }
+ts_control_serde  = { path = "vendor/tailscale-rs/ts_control_serde" }
+ts_transport_derp = { path = "vendor/tailscale-rs/ts_transport_derp" }
+ts_keys           = { path = "vendor/tailscale-rs/ts_keys" }
 # `ts_packet::PacketMut` is the bytes-wrapper the DERP API wants on its send
 # path; we use it directly to avoid pulling the umbrella `tailscale` crate.
-ts_packet         = { path = "vendor/tailscale-rs/ts_packet", optional = true }
+ts_packet         = { path = "vendor/tailscale-rs/ts_packet" }
 
 # Lock-free hashmap. PeerTable indices are hot on every ingress and egress
 # packet, and the dispatch + send paths run concurrently with the netmap
 # reconciler; a `Mutex<HashMap>` would serialise them.
-dashmap           = { version = "6", optional = true }
+dashmap           = "6"
 
 # Pulled in transitively already (via tokio_util, hyper, etc.) but we want
-# direct names at the crate boundary so the `DerpClient` wrapper stays
-# independent of which transitive dep's re-export we happen to use.
-bytes             = { version = "1", optional = true }
-url               = { version = "2", optional = true }
-# Used at module boundaries that surface `ts_control::TailnetAddress`
-# (whose `ipv4`/`ipv6` fields are `ipnet::Ipv{4,6}Net`). Vendored
-# tailscale-rs transitively depends on ipnet already; declaring it
-# directly lets our unit tests construct `Ipv4Net` without going via a
-# string parse.
-ipnet             = { version = "2", optional = true }
+# direct names at the crate boundary so our wrappers stay independent of
+# which transitive dep's re-export we happen to use.
+bytes             = "1"
+url               = "2"
+# Surfaces through `ts_control::TailnetAddress` (whose `ipv4`/`ipv6`
+# fields are `ipnet::Ipv{4,6}Net`) and used by tests to construct them.
+ipnet             = "2"
 
 [[bin]]
 name = "burrow"
@@ -97,34 +92,13 @@ embedded-config = []
 # normally so `cargo test` output stays useful.
 silent = ["tracing/release_max_level_off"]
 
-# Experimental Stage 0 scaffolding for the Headscale fork. Pulls in the
-# vendored tailscale-rs crates under `vendor/tailscale-rs/` as path deps
-# and activates the `headscale`/`derp`/`peer_table` stub modules. Default
-# build (no features) remains the stock wg-quick gateway.
-headscale = [
-    "dep:ts_control",
-    "dep:ts_control_noise",
-    "dep:ts_control_serde",
-    "dep:ts_transport_derp",
-    "dep:ts_keys",
-    "dep:ts_packet",
-    "dep:dashmap",
-    "dep:bytes",
-    "dep:url",
-    "dep:ipnet",
-]
-
-# Test-only toggle that forwards `ts_transport_derp`'s `insecure-for-tests`
-# through to our build, letting the real-DERP round-trip integration test
-# (`tests/derp_real_roundtrip.rs`) connect to a local Headscale container
-# with a self-signed cert or no cert at all. Not for production builds.
-headscale-insecure-tests = [
-    "headscale",
-    "ts_transport_derp?/insecure-for-tests",
-    # Allow ts_control to fetch the control server key over plain HTTP
-    # (Headscale configured without TLS for local tests — valid certs
-    # aren't in scope for a loopback tunnel).
-    "ts_control?/insecure-keyfetch",
+# Test-only toggle: forward `ts_transport_derp`'s `insecure-for-tests`
+# and `ts_control`'s `insecure-keyfetch` through so loopback tests can
+# talk to a local Headscale (or bare derper) over self-signed TLS or
+# plain HTTP. Not for production builds.
+insecure-tests = [
+    "ts_transport_derp/insecure-for-tests",
+    "ts_control/insecure-keyfetch",
 ]
 
 [target.'cfg(windows)'.dependencies]

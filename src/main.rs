@@ -15,8 +15,8 @@ use tracing_subscriber::EnvFilter;
 use burrow::config;
 use burrow::control::{listener_key, spawn_control_handler};
 use burrow::icmp::{
-    build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder,
-    ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
+    build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder, ICMP_CODE_HOST_UNREACHABLE,
+    ICMP_CODE_NET_UNREACHABLE,
 };
 use burrow::nat::{NatKey, NatTable};
 use burrow::probe::{classify_connect_error, ConnectClass};
@@ -26,7 +26,6 @@ use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
 use burrow::tunnel::WgTunnel;
 use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
-
 
 /// Optional config baked in at build time via the `embedded-config` feature.
 /// The path is taken from `BURROW_EMBEDDED_CONFIG` at build time; `build.rs`
@@ -58,6 +57,15 @@ type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 /// The gateway binary is intentionally minimal: just the runtime. All
 /// utility commands (keygen, gen) live in `burrow-client` so they
 /// don't bloat the deploy binary.
+///
+/// Two transports are selected between at runtime:
+///
+/// - Default (wg-quick): `--config` + optional `--endpoint` /
+///   `--keepalive`. Loads a wg-quick conf and connects via UDP to a
+///   kernel WG server.
+/// - Headscale fork (`--server-url` set, feature-gated at build): reg
+///   isters as a tailnet node and runs over DERP. `--config` is
+///   ignored on this path.
 #[derive(Parser, Debug)]
 #[command(version, about = "WireGuard userspace gateway")]
 struct Cli {
@@ -75,11 +83,42 @@ struct Cli {
     /// Override PersistentKeepalive (seconds; 0 disables).
     #[arg(long)]
     keepalive: Option<u16>,
+
+    /// Headscale coordination server URL. If set, the binary uses the
+    /// Headscale/DERP transport path instead of the wg-quick path.
+    #[arg(long, env = "BURROW_HEADSCALE_URL")]
+    server_url: Option<String>,
+
+    /// Headscale preauth key. Required when `--server-url` is set.
+    #[arg(long, env = "BURROW_HEADSCALE_AUTHKEY")]
+    authkey: Option<String>,
+
+    /// Hostname to advertise to Headscale. Defaults to the OS
+    /// hostname (via `gethostname`) inside `ts_control`.
+    #[arg(long, env = "BURROW_HEADSCALE_HOSTNAME")]
+    hostname: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(server_url) = cli.server_url.as_deref() {
+        use burrow::hs_main::{self, HeadscaleArgs};
+        let url = url::Url::parse(server_url)
+            .with_context(|| format!("parsing --server-url {server_url}"))?;
+        let authkey = cli
+            .authkey
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--server-url requires --authkey"))?;
+        return hs_main::run(HeadscaleArgs {
+            server_url: url,
+            authkey,
+            hostname: cli.hostname.clone(),
+        })
+        .await;
+    }
+
     run(cli.config, cli.endpoint, cli.keepalive).await
 }
 
@@ -443,14 +482,8 @@ async fn ingest_tunnel_packet(
         return;
     }
     if view.dst_ip == wg_ip && view.proto == PROTO_UDP {
-        burrow::udp_reverse::dispatch_udp_to_wg_ip(
-            &packet,
-            &view,
-            wg_ip,
-            egress_tx,
-            dns_enabled,
-        )
-        .await;
+        burrow::udp_reverse::dispatch_udp_to_wg_ip(&packet, &view, wg_ip, egress_tx, dns_enabled)
+            .await;
         return;
     }
     match view.proto {
@@ -490,7 +523,11 @@ async fn ingest_tunnel_packet(
                     use smoltcp::wire::{Ipv4Packet, TcpPacket};
                     let is_syn_only = Ipv4Packet::new_checked(&packet[..])
                         .ok()
-                        .and_then(|ip| TcpPacket::new_checked(ip.payload()).ok().map(|tcp| tcp.syn() && !tcp.ack()))
+                        .and_then(|ip| {
+                            TcpPacket::new_checked(ip.payload())
+                                .ok()
+                                .map(|tcp| tcp.syn() && !tcp.ack())
+                        })
                         .unwrap_or(false);
                     if !is_syn_only {
                         debug!(?key, "tcp packet to unknown flow (not SYN) — dropping");

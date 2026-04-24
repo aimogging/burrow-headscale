@@ -4,8 +4,8 @@
 //! until the netmap pump publishes a `ControlState` with our assigned
 //! tailnet IP, and asserts the IP falls inside Headscale's configured
 //! CGNAT prefix. This is the automated counterpart of running
-//! `cargo run --features headscale --bin burrow -- --server-url …
-//! --authkey …` and checking `headscale nodes list` by eye.
+//! `cargo run --bin burrow -- --server-url … --authkey …` and
+//! checking `headscale nodes list` by eye.
 //!
 //! Configure via env:
 //!   BURROW_TEST_HEADSCALE_URL     e.g. http://localhost:18443
@@ -17,8 +17,7 @@
 //!   ssh -fN -L 18443:localhost:8443 do
 //!   BURROW_TEST_HEADSCALE_URL=http://localhost:18443 \
 //!     BURROW_TEST_HEADSCALE_AUTHKEY=hskey-auth-... \
-//!     cargo test --features headscale-insecure-tests \
-//!       --test headscale_register_roundtrip
+//!     cargo test --features insecure-tests --test headscale_register_roundtrip
 //!
 //! Known constraint: the Headscale instance must be configured with
 //! *both* IPv4 and IPv6 `prefixes` (default v4 + a v6 like
@@ -30,7 +29,7 @@
 //! rebase of vendored tailscale-rs is a good moment to broaden this
 //! type to `(Ipv4Net, Option<Ipv6Net>)`.
 
-#![cfg(feature = "headscale-insecure-tests")]
+#![cfg(feature = "insecure-tests")]
 
 use std::time::Duration;
 

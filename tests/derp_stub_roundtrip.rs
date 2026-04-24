@@ -15,8 +15,6 @@
 //! Stage 1e will re-run this shape against a real derper to cover the
 //! transport itself.
 
-#![cfg(feature = "headscale")]
-
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;

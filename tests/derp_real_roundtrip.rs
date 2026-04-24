@@ -21,10 +21,9 @@
 //! Typical local setup (see session notes):
 //!   ssh -fN -L 18443:localhost:8443 do
 //!   BURROW_TEST_DERP_URL=https://localhost:18443 \
-//!     cargo test --features headscale-insecure-tests \
-//!       --test derp_real_roundtrip
+//!     cargo test --features insecure-tests --test derp_real_roundtrip
 
-#![cfg(feature = "headscale-insecure-tests")]
+#![cfg(feature = "insecure-tests")]
 
 use std::net::Ipv4Addr;
 use std::time::Duration;

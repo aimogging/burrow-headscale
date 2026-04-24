@@ -21,8 +21,6 @@
 //! Nothing persists to disk (design constraint): `generate()` draws fresh
 //! material each boot.
 
-#![cfg(feature = "headscale")]
-
 use ts_keys::NodeState;
 use x25519_dalek::{PublicKey, StaticSecret};
 

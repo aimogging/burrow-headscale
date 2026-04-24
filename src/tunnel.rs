@@ -50,11 +50,10 @@ impl WgCore {
     }
 
     /// Constructor for callers that don't have a wg-quick [`Config`] — used by
-    /// the Headscale fork's `Peer`, where each peer's Tunn is built from raw
-    /// keys supplied by a `MapResponse` plus the node's own private key.
-    /// Preshared keys aren't part of the Headscale data model, so callers that
-    /// don't use one pass `None`.
-    #[cfg(feature = "headscale")]
+    /// the fork's `Peer`, where each peer's Tunn is built from raw keys
+    /// supplied by a `MapResponse` plus the node's own private key.
+    /// Preshared keys aren't part of the Headscale data model, so callers
+    /// that don't use one pass `None`.
     pub fn from_raw(
         private_key: x25519_dalek::StaticSecret,
         peer_public_key: x25519_dalek::PublicKey,
@@ -345,7 +344,9 @@ mod tests {
     #[test]
     fn handshake_init_produces_network_packet() {
         let core = WgCore::new(&make_config());
-        let step = core.handshake_init(false).expect("handshake should succeed");
+        let step = core
+            .handshake_init(false)
+            .expect("handshake should succeed");
         assert_eq!(
             step.to_network.len(),
             1,
@@ -442,5 +443,4 @@ mod tests {
         // Immediate tick should be a no-op (handshake just sent).
         tunnel.tick_timers().await.expect("tick ok");
     }
-
 }
