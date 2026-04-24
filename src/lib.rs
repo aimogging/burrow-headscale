@@ -20,6 +20,7 @@ pub mod udp_reverse;
 pub mod wire;
 pub mod yamux_bridge;
 
+pub mod client_session;
 pub mod derp;
 pub mod headscale;
 pub mod hs_main;

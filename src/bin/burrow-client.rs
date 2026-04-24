@@ -19,11 +19,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+use burrow::client_session::ClientSession;
 use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
 use burrow::config_gen::{generate, GenParams};
 use burrow::reverse_registry::OpenRequest;
@@ -34,12 +35,62 @@ use burrow::wire::{
 };
 use burrow::yamux_bridge::{drive_connection, udp_frame};
 
+/// Combined AsyncRead + AsyncWrite trait object — used as `Box<dyn Conn>`
+/// so the tunnel/shell subcommands can drive either a direct OS TCP
+/// stream (legacy path) or a DERP-backed [`ClientSession::open_tcp`]
+/// stream through the same code.
+pub trait Conn: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> Conn for T {}
+
+type BoxedConn = Box<dyn Conn>;
+
+/// Where to reach burrow's control listener. `DirectTcp` is the old
+/// routing-aware path (user's OS has a route to `burrow_wg_ip` via
+/// wg-quick); `Tailnet` dials through a live [`ClientSession`] which
+/// encrypts and relays via DERP.
+enum BurrowTarget<'a> {
+    DirectTcp(SocketAddrV4),
+    Tailnet {
+        session: &'a ClientSession,
+        burrow_ip: Ipv4Addr,
+        control_port: u16,
+    },
+}
+
+impl BurrowTarget<'_> {
+    fn label(&self) -> String {
+        match self {
+            BurrowTarget::DirectTcp(addr) => addr.to_string(),
+            BurrowTarget::Tailnet {
+                burrow_ip,
+                control_port,
+                ..
+            } => format!("tailnet://{burrow_ip}:{control_port}"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
     about = "burrow companion CLI: tunnels, shell, keygen, config gen"
 )]
 struct Cli {
+    /// Headscale server URL. When set, `tunnel` and `shell` reach
+    /// burrow through the DERP-backed tailnet instead of dialing
+    /// `burrow_wg_ip` directly. Requires `--authkey`.
+    #[arg(long, env = "BURROW_HEADSCALE_URL", global = true)]
+    server_url: Option<String>,
+
+    /// Headscale preauth key for `--server-url`. Accepted from the env
+    /// so scripts don't leak keys through shell history.
+    #[arg(long, env = "BURROW_HEADSCALE_AUTHKEY", global = true)]
+    authkey: Option<String>,
+
+    /// Hostname to advertise to Headscale. Defaults to the OS hostname.
+    #[arg(long, env = "BURROW_HEADSCALE_HOSTNAME", global = true)]
+    hostname: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -185,22 +236,35 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    match cli.cmd {
+    let Cli {
+        server_url,
+        authkey,
+        hostname,
+        cmd,
+    } = cli;
+    let creds = HeadscaleCreds {
+        server_url,
+        authkey,
+        hostname,
+    };
+    match cmd {
         Cmd::Tunnel {
             burrow_ip,
             control_port,
             action,
         } => {
-            let addr = SocketAddrV4::new(burrow_ip, control_port);
-            run_tunnel(addr, action).await
+            let session = maybe_connect_session(&creds).await?;
+            let target = target_for(&session, burrow_ip, control_port);
+            run_tunnel(target, action).await
         }
         Cmd::Shell {
             burrow_ip,
             control_port,
             args,
         } => {
-            let addr = SocketAddrV4::new(burrow_ip, control_port);
-            run_shell(addr, args).await
+            let session = maybe_connect_session(&creds).await?;
+            let target = target_for(&session, burrow_ip, control_port);
+            run_shell(target, args).await
         }
         Cmd::Keygen => keygen(),
         Cmd::Gen(args) => gen_configs(args),
@@ -209,6 +273,49 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             authkey,
             hostname,
         } => run_login(server_url, authkey, hostname).await,
+    }
+}
+
+struct HeadscaleCreds {
+    server_url: Option<String>,
+    authkey: Option<String>,
+    hostname: Option<String>,
+}
+
+/// When the user supplies headscale credentials, register and bring up
+/// a [`ClientSession`]. Otherwise return `None`; subcommands fall back
+/// to direct TCP. Errors out if one of `--server-url`/`--authkey` is
+/// provided without the other — that's almost certainly a misconfig.
+async fn maybe_connect_session(creds: &HeadscaleCreds) -> Result<Option<ClientSession>> {
+    match (&creds.server_url, &creds.authkey) {
+        (None, None) => Ok(None),
+        (Some(url), Some(key)) => {
+            let parsed =
+                url::Url::parse(url).with_context(|| format!("parsing --server-url {url}"))?;
+            let session = ClientSession::connect(parsed, key, creds.hostname.clone())
+                .await
+                .context("ClientSession::connect")?;
+            Ok(Some(session))
+        }
+        (Some(_), None) => bail!("--server-url requires --authkey (or BURROW_HEADSCALE_AUTHKEY)"),
+        (None, Some(_)) => {
+            bail!("--authkey requires --server-url (or BURROW_HEADSCALE_URL)")
+        }
+    }
+}
+
+fn target_for<'a>(
+    session: &'a Option<ClientSession>,
+    burrow_ip: Ipv4Addr,
+    control_port: u16,
+) -> BurrowTarget<'a> {
+    match session {
+        Some(s) => BurrowTarget::Tailnet {
+            session: s,
+            burrow_ip,
+            control_port,
+        },
+        None => BurrowTarget::DirectTcp(SocketAddrV4::new(burrow_ip, control_port)),
     }
 }
 
@@ -323,26 +430,43 @@ fn set_private_file_permissions(_path: &std::path::Path) {
     // is out of scope for v1. Files inherit the parent directory's ACL.
 }
 
-async fn connect_control(addr: SocketAddrV4) -> Result<TcpStream> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("connecting to burrow control at {addr}"))?;
-    stream.set_nodelay(true).ok();
-    Ok(stream)
+async fn connect_control(target: &BurrowTarget<'_>) -> Result<BoxedConn> {
+    match target {
+        BurrowTarget::DirectTcp(addr) => {
+            let stream = TcpStream::connect(*addr)
+                .await
+                .with_context(|| format!("connecting to burrow control at {addr}"))?;
+            stream.set_nodelay(true).ok();
+            Ok(Box::new(stream))
+        }
+        BurrowTarget::Tailnet {
+            session,
+            burrow_ip,
+            control_port,
+        } => {
+            let stream = session
+                .open_tcp(*burrow_ip, *control_port)
+                .await
+                .with_context(|| {
+                    format!("connecting to burrow control at tailnet://{burrow_ip}:{control_port}")
+                })?;
+            Ok(Box::new(stream))
+        }
+    }
 }
 
-async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
+async fn run_tunnel(target: BurrowTarget<'_>, action: TunnelCmd) -> Result<ExitCode> {
     match action {
         TunnelCmd::Start { spec, udp } => {
             let (bind, listen_port, forward_to) = parse_r_spec(&spec)?;
             let proto = if udp { Proto::Udp } else { Proto::Tcp };
-            run_tunnel_start(addr, proto, bind, listen_port, forward_to).await
+            run_tunnel_start(target, proto, bind, listen_port, forward_to).await
         }
         TunnelCmd::Stop { tunnel_id } => {
             let req = ClientReq::StopReverse {
                 tunnel_id: TunnelId(tunnel_id),
             };
-            let resp = one_shot_request(addr, &req).await?;
+            let resp = one_shot_request(&target, &req).await?;
             match resp {
                 ServerResp::Stopped => {
                     println!("stopped {tunnel_id}");
@@ -356,7 +480,7 @@ async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
             }
         }
         TunnelCmd::List => {
-            let resp = one_shot_request(addr, &ClientReq::ListReverse).await?;
+            let resp = one_shot_request(&target, &ClientReq::ListReverse).await?;
             match resp {
                 ServerResp::ReverseList(entries) => {
                     if entries.is_empty() {
@@ -389,7 +513,7 @@ async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
     }
 }
 
-async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
+async fn run_shell(target: BurrowTarget<'_>, args: ShellArgs) -> Result<ExitCode> {
     // Default is Interactive (matches the plan: an `ssh`-like UX
     // where bare `shell` drops you into a prompt). `--output` opts
     // into one-shot capture; `--detach` opts into fire-and-forget.
@@ -405,14 +529,14 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
     // Interactive takes over the flow after ShellReady. Hand off to a
     // dedicated handler rather than using the one-shot request helper.
     if mode == ShellMode::Interactive {
-        return run_shell_interactive(addr, args.program, args.args).await;
+        return run_shell_interactive(target, args.program, args.args).await;
     }
     let req = ClientReq::RequestShell {
         mode,
         program: args.program,
         args: args.args,
     };
-    let resp = one_shot_request(addr, &req).await?;
+    let resp = one_shot_request(&target, &req).await?;
     match resp {
         ServerResp::ShellResult {
             exit_code,
@@ -467,13 +591,13 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
 /// binary accepts it, dials `forward_to` locally, and pumps bytes.
 /// Exits on Ctrl-C or when the control flow drops.
 async fn run_tunnel_start(
-    addr: SocketAddrV4,
+    target: BurrowTarget<'_>,
     proto: Proto,
     bind: BindAddr,
     listen_port: u16,
     forward_to: String,
 ) -> Result<ExitCode> {
-    let mut stream = connect_control(addr).await?;
+    let mut stream = connect_control(&target).await?;
     let spec = TunnelSpec {
         listen_port,
         forward_to: forward_to.clone(),
@@ -698,12 +822,12 @@ async fn run_udp_substream(
 
 /// Send one request, read one response, close. Most subcommands follow
 /// this shape.
-async fn one_shot_request(addr: SocketAddrV4, req: &ClientReq) -> Result<ServerResp> {
-    let mut stream = connect_control(addr).await?;
+async fn one_shot_request(target: &BurrowTarget<'_>, req: &ClientReq) -> Result<ServerResp> {
+    let mut stream = connect_control(target).await?;
     write_frame(&mut stream, req).await?;
     let resp: ServerResp = read_frame(&mut stream)
         .await
-        .map_err(|e| anyhow!("reading response: {e}"))?;
+        .map_err(|e| anyhow!("reading response from {}: {e}", target.label()))?;
     let _ = stream.shutdown().await;
     Ok(resp)
 }
@@ -805,11 +929,11 @@ fn restore_windows_console(prev_stdin: Option<u32>, prev_stdout: Option<u32>) {
 /// both directions: STDIN / RESIZE / STDIN_EOF client→server, STDOUT /
 /// EXIT server→client.
 async fn run_shell_interactive(
-    addr: SocketAddrV4,
+    target: BurrowTarget<'_>,
     program: Option<String>,
     cmd_args: Vec<String>,
 ) -> Result<ExitCode> {
-    let mut stream = connect_control(addr).await?;
+    let mut stream = connect_control(&target).await?;
     let req = ClientReq::RequestShell {
         mode: ShellMode::Interactive,
         program,
@@ -842,7 +966,7 @@ async fn run_shell_interactive(
         default_hook(info);
     }));
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Send the initial terminal size so the server sizes the PTY
     // correctly on the first prompt render.

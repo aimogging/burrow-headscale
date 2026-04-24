@@ -70,6 +70,16 @@ const IDLE_SLEEP: Duration = Duration::from_millis(2);
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ConnectionId(u64);
 
+impl ConnectionId {
+    /// Test-only constructor. Callers are responsible for never feeding
+    /// these synthesised ids back into a live smoltcp runtime — they
+    /// collide with the real id space, which starts at 0 and increments.
+    #[doc(hidden)]
+    pub fn for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 pub enum SmoltcpCmd {
     /// Idempotently create a TCP listener bound to `(virtual_ip, port)` and
     /// tag it with `key` so the runtime can route the eventual ESTABLISHED
