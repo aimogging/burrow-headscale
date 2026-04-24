@@ -135,7 +135,9 @@ If raw socket creation fails at startup, ICMP echo requests from peers receive *
 
 ## Workflow Rules
 
-- **Commit regularly during code changes.** Feature completion or major refactors are good points to commit. Don't let large unrelated changes pile up in a single commit.
-- **Update plan docs in place.** The implementation plan lives at `C:\Users\user\.claude\plans\gentle-twirling-hartmanis.md`. Edit it as decisions evolve. Do not flood the directory with new markdown files.
-- **All major features must be well tested.** Unit, functional, and end-to-end tests are required for each feature. Don't ship a feature without all three layers covered (or an explicit note explaining why one layer is N/A).
-- **Prompt before standing up E2E infrastructure.** End-to-end tests require external infrastructure (WireGuard server, internal network targets). Ask the user before assuming infra exists or starting to provision it.
+- **Commit regularly.** After feature additions, major code changes, and logical stopping points. Don't let large unrelated changes pile up in a single commit.
+- **Every code addition must be backed by appropriate tests.** Unit, integration, regression, or end-to-end — whichever fits. Don't ship a feature without a test (or an explicit note explaining why a layer is genuinely N/A, e.g. the code requires external infra that hasn't been authorised).
+- **Prefer Test-Driven Development.** Write the failing test, then the implementation. Strongest for pure library code (key types, protocol primitives, data structures); relaxed for I/O glue where test and code are entangled.
+- **Always format code before pushing.** `cargo fmt --all` at every push boundary. If edits landed without `cargo fmt`, fix before pushing.
+- **Update plan docs in place.** Burrow-headscale's implementation plan lives at `C:\Users\user\.claude\plans\system-reminder-you-re-running-in-functional-narwhal.md`. Edit it as decisions evolve. Do not flood the directory with new markdown files.
+- **Prompt before standing up E2E infrastructure.** End-to-end tests require external infrastructure (WireGuard server, Headscale + DERP, internal network targets). Ask before assuming infra exists or starting to provision it.
