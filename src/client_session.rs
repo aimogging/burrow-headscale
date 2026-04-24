@@ -51,8 +51,9 @@ use crate::nat::NatTable;
 use crate::node_identity::NodeIdentity;
 use crate::peer_reconciler::spawn_reconciler;
 use crate::peer_table::PeerTable;
-use crate::rewrite;
+use crate::rewrite::{self, PROTO_UDP};
 use crate::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
+use crate::udp_proxy::extract_udp_payload;
 
 /// How long `open_tcp` waits for the target peer to show up in the
 /// Headscale netmap before failing. Typical Headscale delivers the
@@ -84,6 +85,15 @@ enum StreamEvent {
 
 type StreamRegistry = Arc<Mutex<HashMap<ConnectionId, mpsc::UnboundedSender<StreamEvent>>>>;
 
+/// One datagram dispatched to a `UdpReceiver`: sender tailnet IP,
+/// sender port, payload.
+pub type UdpDatagram = (Ipv4Addr, u16, Vec<u8>);
+
+/// Per-local-port UDP listener registry. Ingress looks up by the
+/// packet's *destination* port (our ephemeral) and pushes the
+/// datagram to the matching listener.
+type UdpDispatchMap = Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<UdpDatagram>>>>;
+
 pub struct ClientSession {
     tailnet_ip: Ipv4Addr,
     peers: Arc<PeerTable>,
@@ -91,11 +101,43 @@ pub struct ClientSession {
     derp: Arc<DerpClient>,
     headscale: HeadscaleClient,
     streams: StreamRegistry,
+    udp_listeners: UdpDispatchMap,
     tasks: Vec<JoinHandle<()>>,
-    /// Monotonic ephemeral-port allocator for outbound connects.
-    /// `fetch_add` wraps at `u16::MAX`; we offset into the RFC 6335
-    /// ephemeral range [`EPHEMERAL_PORT_FLOOR`..=65535] on each call.
+    /// Monotonic ephemeral-port allocator for outbound TCP connects
+    /// and UDP binds. Both protocols share the range since local
+    /// bookkeeping only cares about (proto, port) collisions and we
+    /// never overlap within a single protocol — `fetch_add` wraps at
+    /// `u16::MAX` and we remap into
+    /// [`EPHEMERAL_PORT_FLOOR`..=65535].
     next_ephemeral: Arc<AtomicU16>,
+}
+
+/// Receiver handle for UDP datagrams dispatched to a bound port.
+/// Dropping this unregisters the listener from the session's
+/// dispatch table — subsequent datagrams on that port are dropped
+/// silently.
+pub struct UdpReceiver {
+    port: u16,
+    rx: mpsc::UnboundedReceiver<UdpDatagram>,
+    listeners: UdpDispatchMap,
+}
+
+impl UdpReceiver {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Next datagram for this bound port. Returns `None` once the
+    /// dispatcher task exits (i.e. the session is shutting down).
+    pub async fn recv(&mut self) -> Option<UdpDatagram> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for UdpReceiver {
+    fn drop(&mut self) {
+        self.listeners.lock().unwrap().remove(&self.port);
+    }
 }
 
 impl ClientSession {
@@ -145,12 +187,14 @@ impl ClientSession {
             }
         });
 
+        let udp_listeners: UdpDispatchMap = Arc::new(Mutex::new(HashMap::new()));
         let ingress = tokio::spawn({
             let peers = Arc::clone(&peers);
             let derp = Arc::clone(&derp);
             let smoltcp = smoltcp.clone();
+            let udp_listeners = Arc::clone(&udp_listeners);
             async move {
-                ingress_loop(derp_rx, peers, derp, smoltcp).await;
+                ingress_loop(derp_rx, peers, derp, smoltcp, tailnet_ip, udp_listeners).await;
             }
         });
 
@@ -180,6 +224,7 @@ impl ClientSession {
             derp,
             headscale,
             streams,
+            udp_listeners,
             tasks,
             next_ephemeral: Arc::new(AtomicU16::new(0)),
         })
@@ -269,6 +314,74 @@ impl ClientSession {
     /// snapshot. A fixed-interval poll catches the peer once the
     /// reconciler's insert lands in the DashMap, independent of the
     /// netmap-to-reconciler ordering.
+    /// Bind a UDP listener on a fresh ephemeral port. Returned
+    /// [`UdpReceiver`] deregisters the listener on drop. Use the
+    /// returned port as the `src_port` when calling
+    /// [`ClientSession::send_udp`]; datagrams whose dst port matches
+    /// will be dispatched to the receiver.
+    pub fn bind_udp(&self) -> UdpReceiver {
+        let port = self.alloc_ephemeral_port();
+        let (tx, rx) = mpsc::unbounded_channel::<UdpDatagram>();
+        self.udp_listeners.lock().unwrap().insert(port, tx);
+        UdpReceiver {
+            port,
+            rx,
+            listeners: Arc::clone(&self.udp_listeners),
+        }
+    }
+
+    /// Send a UDP datagram from `(our_tailnet_ip, src_port)` to
+    /// `(dst, dst_port)`. Waits for the peer to appear in the netmap
+    /// + triggers a WG handshake-init side-effect on the first call
+    /// so subsequent requests pay only 1 RTT.
+    pub async fn send_udp(
+        &self,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.wait_for_peer(dst).await?;
+        let peer = self
+            .peers
+            .by_tailnet_ip(&dst)
+            .ok_or_else(|| anyhow!("peer {dst} disappeared between wait and send"))?;
+        let packet = rewrite::build_udp_packet(self.tailnet_ip, dst, src_port, dst_port, payload);
+        let step = peer
+            .core
+            .encapsulate(&packet)
+            .context("encapsulating UDP datagram")?;
+        for bytes in step.to_network {
+            self.derp
+                .send(peer.node_key, &bytes)
+                .await
+                .context("DERP send (UDP)")?;
+        }
+        Ok(())
+    }
+
+    /// Fire-and-await-response convenience wrapper: binds a UDP
+    /// listener, sends a datagram, awaits the first reply (regardless
+    /// of source), and drops the listener. Suitable for request-reply
+    /// protocols like DNS. For multi-reply flows, use
+    /// [`ClientSession::bind_udp`] + [`ClientSession::send_udp`]
+    /// directly.
+    pub async fn query_udp(
+        &self,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let mut recv = self.bind_udp();
+        self.send_udp(recv.port(), dst, dst_port, payload).await?;
+        let (_src, _from_port, reply) = tokio::time::timeout(timeout, recv.recv())
+            .await
+            .map_err(|_| anyhow!("UDP query to {dst}:{dst_port} timed out after {timeout:?}"))?
+            .ok_or_else(|| anyhow!("UDP listener channel closed"))?;
+        Ok(reply)
+    }
+
     async fn wait_for_peer(&self, dst: Ipv4Addr) -> Result<()> {
         let deadline = tokio::time::Instant::now() + PEER_WAIT_TIMEOUT;
         let mut logged = false;
@@ -384,6 +497,8 @@ async fn ingress_loop(
     peers: Arc<PeerTable>,
     derp: Arc<DerpClient>,
     smoltcp: SmoltcpHandle,
+    tailnet_ip: Ipv4Addr,
+    udp_listeners: UdpDispatchMap,
 ) {
     while let Some(frame) = derp_rx.recv().await {
         let Some(peer) = peers.by_node_key(&frame.sender) else {
@@ -406,6 +521,27 @@ async fn ingress_loop(
             warn!("ingress: peer session expired");
         }
         if let Some(tp) = step.to_tunnel {
+            // UDP datagrams addressed to one of our bound ports go to
+            // the matching listener. Everything else falls through to
+            // smoltcp (TCP flows + anything unbound — dropped there).
+            if let Ok(view) = rewrite::parse_5tuple(&tp.data) {
+                if view.proto == PROTO_UDP && view.dst_ip == tailnet_ip {
+                    let listener = udp_listeners.lock().unwrap().get(&view.dst_port).cloned();
+                    if let Some(tx) = listener {
+                        if let Some(payload) = extract_udp_payload(&tp.data) {
+                            let _ = tx.send((view.src_ip, view.src_port, payload));
+                            continue;
+                        }
+                        debug!(?view, "ingress: malformed UDP payload, dropping");
+                        continue;
+                    }
+                    debug!(
+                        dst_port = view.dst_port,
+                        "ingress: UDP to unbound port, dropping"
+                    );
+                    continue;
+                }
+            }
             smoltcp.enqueue_inbound(tp.data);
         }
     }

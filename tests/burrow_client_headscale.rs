@@ -1,21 +1,34 @@
-//! Stage 4d + follow-ups — burrow-client ↔ burrow end-to-end over DERP.
+//! Real-DERP end-to-end coverage for burrow-client ↔ burrow.
 //!
-//! Originally the Stage 4d smoke test: a [`ClientSession`] opens a TCP
-//! connection to a burrow subprocess and round-trips one CBOR request.
-//! Extended in the post-5 hardening pass with full-CLI tests covering
-//! the three primary user-facing workflows over real DERP:
+//! Each test spawns burrow as a subprocess (or two), registers a
+//! [`ClientSession`] in-process, and exercises one user-facing path
+//! against a live Headscale + DERP. All of these run at 5–10 s each,
+//! ~45 s total serial.
 //!
-//! - `client_session_round_trips_cbor_against_burrow` — the original
-//!   smoke test; proves the DERP → smoltcp path carries CBOR bytes.
+//! - `client_session_round_trips_cbor_against_burrow` — the Stage 4d
+//!   smoke test; proves the DERP → smoltcp path carries CBOR bytes
+//!   (one `ListReverse`).
 //! - `tcp_reverse_tunnel_round_trips_bytes_via_real_derp` — spawns
 //!   `burrow-client tunnel … start -R`, verifies a plain TCP
 //!   connection to `burrow:<listen_port>` echoes through a yamux
 //!   substream to a local mock target.
-//! - `udp_reverse_tunnel_round_trips_datagrams_via_real_derp` — same,
-//!   UDP.
+//! - `udp_reverse_tunnel_round_trips_datagrams_via_real_derp` — same
+//!   with `-U` + datagrams.
 //! - `shell_oneshot_runs_command_via_real_derp` — runs
-//!   `burrow-client shell … --program echo-equiv`, asserts captured
-//!   stdout.
+//!   `burrow-client shell … --program <echo>`, asserts captured stdout.
+//! - `dns_resolver_answers_query_via_real_derp` — builds a hickory
+//!   A-query for `localhost`, sends via
+//!   [`ClientSession::query_udp`], asserts burrow's built-in DNS
+//!   service answers.
+//! - `client_session_routes_to_multiple_burrow_peers` — two burrow
+//!   subprocesses + one session, round-trips CBOR against each;
+//!   proves PeerTable reconciliation + per-peer Tunn routing at N>2.
+//! - `interactive_shell_runs_chained_commands_via_real_derp` —
+//!   bypasses the terminal-requiring CLI path, drives the framed
+//!   stdio protocol (`src/shell_protocol.rs`) directly. Sends three
+//!   chained commands (`echo one`, `echo two`, `exit`) and scrapes
+//!   the PTY output for both echo results + the EXIT frame. Responds
+//!   to ConPTY's cursor-position DSR query so Windows doesn't hang.
 //!
 //! Opt in at runtime:
 //!
@@ -673,6 +686,418 @@ async fn shell_oneshot_runs_command_via_real_derp() {
     assert!(
         stdout.contains("hello"),
         "expected 'hello' in captured stdout, got {stdout:?}"
+    );
+
+    let _ = burrow.kill().await;
+}
+
+/// DNS end-to-end: burrow's built-in resolver on `(wg_ip, 53/udp)`
+/// answers an A query for `localhost` sent from the `ClientSession`
+/// over DERP. Exercises the UDP dispatch path in both directions:
+/// client-side [`ClientSession::query_udp`] builds + encapsulates a
+/// UDP datagram, burrow's `udp_reverse::dispatch_udp_to_wg_ip` routes
+/// to `dns_service::handle_query`, the response datagram rides back
+/// through DERP, and the client-side UDP listener dispatches it to
+/// the awaiting `recv()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dns_resolver_answers_query_via_real_derp() {
+    use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+    use hickory_proto::rr::{DNSClass, Name, RecordType};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+    let Some((url, authkey)) = env() else {
+        eprintln!("BURROW_TEST_HEADSCALE_{{URL,AUTHKEY}} not set; skipping");
+        return;
+    };
+    init_test_tracing();
+    let tag = unique_tag();
+
+    let mut burrow =
+        spawn_burrow(&url, &authkey, &format!("burrow-dns-{tag}")).expect("spawn burrow");
+    let burrow_ip = match wait_for_tailnet_ip(&mut burrow, Duration::from_secs(20)).await {
+        Some(ip) => ip,
+        None => {
+            let _ = burrow.kill().await;
+            panic!("burrow subprocess never logged tailnet_ip within 20s");
+        }
+    };
+
+    let url_parsed = url::Url::parse(&url).expect("URL parse");
+    let session =
+        match ClientSession::connect(url_parsed, &authkey, Some(format!("client-dns-{tag}"))).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = burrow.kill().await;
+                panic!("ClientSession::connect failed: {e:?}");
+            }
+        };
+    eprintln!(
+        "test nodes registered: burrow={burrow_ip}, client={}",
+        session.tailnet_ip()
+    );
+
+    // Build A-query for "localhost" — same shape as
+    // `src/dns_service.rs::tests::build_query`.
+    let mut query = Message::new();
+    query.set_id(0x4242);
+    query.set_message_type(MessageType::Query);
+    query.set_recursion_desired(true);
+    let mut q = Query::new();
+    q.set_name(Name::from_ascii("localhost.").expect("name"));
+    q.set_query_type(RecordType::A);
+    q.set_query_class(DNSClass::IN);
+    query.add_query(q);
+    let query_bytes = query.to_bytes().expect("encode");
+
+    let reply = match timeout(
+        Duration::from_secs(30),
+        session.query_udp(burrow_ip, 53, &query_bytes, Duration::from_secs(20)),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let _ = burrow.kill().await;
+            panic!("query_udp failed: {e:?}");
+        }
+        Err(_) => {
+            let _ = burrow.kill().await;
+            panic!("query_udp timed out at the test-harness level");
+        }
+    };
+
+    let parsed = Message::from_bytes(&reply).expect("decode DNS response");
+    assert_eq!(parsed.id(), 0x4242, "response id must echo the query id");
+    assert_eq!(
+        parsed.response_code(),
+        ResponseCode::NoError,
+        "response code for `localhost` should be NoError"
+    );
+    assert!(
+        !parsed.answers().is_empty(),
+        "expected at least one A record for localhost — got none; \
+         full message: {parsed:?}"
+    );
+    eprintln!(
+        "dns answers for localhost: {:?}",
+        parsed.answers().iter().collect::<Vec<_>>()
+    );
+
+    let _ = burrow.kill().await;
+}
+
+/// Multi-peer end-to-end: one `ClientSession` routes to two
+/// independent burrow subprocesses. Verifies that
+/// `PeerTable::reconcile` + per-peer `boringtun::Tunn` hold up at
+/// N>2 tailnet nodes, and that the outbound egress path picks the
+/// right peer by destination IP. Issues a separate CBOR `ListReverse`
+/// round-trip against each burrow and asserts both return empty
+/// (fresh burrows have no registered tunnels).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_session_routes_to_multiple_burrow_peers() {
+    let Some((url, authkey)) = env() else {
+        eprintln!("BURROW_TEST_HEADSCALE_{{URL,AUTHKEY}} not set; skipping");
+        return;
+    };
+    init_test_tracing();
+    let tag = unique_tag();
+
+    // Spawn two burrow subprocesses in parallel. Distinct hostnames so
+    // Headscale doesn't collapse them into re-registrations of the
+    // same stable identity.
+    let mut burrow_a =
+        spawn_burrow(&url, &authkey, &format!("burrow-a-{tag}")).expect("spawn burrow A");
+    let mut burrow_b =
+        spawn_burrow(&url, &authkey, &format!("burrow-b-{tag}")).expect("spawn burrow B");
+    let ip_a_fut = wait_for_tailnet_ip(&mut burrow_a, Duration::from_secs(20));
+    let ip_b_fut = wait_for_tailnet_ip(&mut burrow_b, Duration::from_secs(20));
+    let (ip_a, ip_b) = tokio::join!(ip_a_fut, ip_b_fut);
+    let ip_a = match ip_a {
+        Some(ip) => ip,
+        None => {
+            let _ = burrow_a.kill().await;
+            let _ = burrow_b.kill().await;
+            panic!("burrow A never logged tailnet_ip within 20s");
+        }
+    };
+    let ip_b = match ip_b {
+        Some(ip) => ip,
+        None => {
+            let _ = burrow_a.kill().await;
+            let _ = burrow_b.kill().await;
+            panic!("burrow B never logged tailnet_ip within 20s");
+        }
+    };
+    eprintln!("burrow_a={ip_a} burrow_b={ip_b}");
+
+    let url_parsed = url::Url::parse(&url).expect("URL parse");
+    let session =
+        match ClientSession::connect(url_parsed, &authkey, Some(format!("client-multi-{tag}")))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = burrow_a.kill().await;
+                let _ = burrow_b.kill().await;
+                panic!("ClientSession::connect failed: {e:?}");
+            }
+        };
+    eprintln!("client_ip={}", session.tailnet_ip());
+
+    async fn exchange(session: &ClientSession, peer_ip: Ipv4Addr) -> Result<(), String> {
+        let mut stream = timeout(
+            Duration::from_secs(30),
+            session.open_tcp(peer_ip, DEFAULT_CONTROL_PORT),
+        )
+        .await
+        .map_err(|_| format!("open_tcp({peer_ip}) timed out"))?
+        .map_err(|e| format!("open_tcp({peer_ip}): {e:?}"))?;
+        write_frame(&mut stream, &ClientReq::ListReverse)
+            .await
+            .map_err(|e| format!("write_frame({peer_ip}): {e}"))?;
+        let resp: ServerResp = timeout(Duration::from_secs(15), read_frame(&mut stream))
+            .await
+            .map_err(|_| format!("read_frame({peer_ip}) timed out"))?
+            .map_err(|e| format!("read_frame({peer_ip}): {e}"))?;
+        let _ = stream.shutdown().await;
+        match resp {
+            ServerResp::ReverseList(entries) if entries.is_empty() => Ok(()),
+            ServerResp::ReverseList(entries) => {
+                Err(format!("expected empty reverse list, got {entries:?}"))
+            }
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+
+    // Talk to A first, then B. Sequential is fine — the point is that
+    // both peers show up in the PeerTable concurrently and routing
+    // picks the right one.
+    if let Err(e) = exchange(&session, ip_a).await {
+        let _ = burrow_a.kill().await;
+        let _ = burrow_b.kill().await;
+        panic!("exchange with burrow A failed: {e}");
+    }
+    eprintln!("cbor round-trip with burrow A succeeded");
+    if let Err(e) = exchange(&session, ip_b).await {
+        let _ = burrow_a.kill().await;
+        let _ = burrow_b.kill().await;
+        panic!("exchange with burrow B failed: {e}");
+    }
+    eprintln!("cbor round-trip with burrow B succeeded");
+
+    let _ = burrow_a.kill().await;
+    let _ = burrow_b.kill().await;
+}
+
+/// Interactive shell end-to-end over real DERP.
+///
+/// The `burrow-client shell` CLI path enables crossterm raw mode +
+/// pumps a real terminal, which isn't drivable from a headless cargo
+/// test. This test skips the CLI wrapper and drives the wire protocol
+/// directly: `ClientSession::open_tcp` to the control port, CBOR
+/// handshake for `ShellMode::Interactive`, then switches the same
+/// stream into the framed stdio protocol from `src/shell_protocol.rs`.
+///
+/// Sends three commands through the PTY as separate STDIN frames —
+/// the shell runs each in turn + echoes output. The assertion only
+/// checks that both command outputs appear somewhere in the
+/// accumulated STDOUT stream: on Windows, ConPTY decorates the
+/// output with prompts + ANSI + command echoes, and on Unix `/bin/sh`
+/// echoes commands back too, so exact matching would be brittle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_shell_runs_chained_commands_via_real_derp() {
+    use burrow::shell_protocol as sp;
+    use burrow::wire::ShellMode;
+
+    let Some((url, authkey)) = env() else {
+        eprintln!("BURROW_TEST_HEADSCALE_{{URL,AUTHKEY}} not set; skipping");
+        return;
+    };
+    init_test_tracing();
+    let tag = unique_tag();
+
+    let mut burrow =
+        spawn_burrow(&url, &authkey, &format!("burrow-pty-{tag}")).expect("spawn burrow");
+    let burrow_ip = match wait_for_tailnet_ip(&mut burrow, Duration::from_secs(20)).await {
+        Some(ip) => ip,
+        None => {
+            let _ = burrow.kill().await;
+            panic!("burrow subprocess never logged tailnet_ip within 20s");
+        }
+    };
+
+    let url_parsed = url::Url::parse(&url).expect("URL parse");
+    let session =
+        match ClientSession::connect(url_parsed, &authkey, Some(format!("client-pty-{tag}"))).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = burrow.kill().await;
+                panic!("ClientSession::connect failed: {e:?}");
+            }
+        };
+
+    let mut stream = match timeout(
+        Duration::from_secs(30),
+        session.open_tcp(burrow_ip, DEFAULT_CONTROL_PORT),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            let _ = burrow.kill().await;
+            panic!("open_tcp failed: {e:?}");
+        }
+        Err(_) => {
+            let _ = burrow.kill().await;
+            panic!("open_tcp timed out");
+        }
+    };
+
+    // CBOR handshake for interactive mode. Default program: cmd.exe
+    // on Windows, /bin/sh on Unix — matches the `burrow-client shell`
+    // default so we exercise the same code path.
+    let (program, args): (Option<String>, Vec<String>) = if cfg!(windows) {
+        (Some("cmd.exe".into()), Vec::new())
+    } else {
+        (Some("/bin/sh".into()), Vec::new())
+    };
+    let req = ClientReq::RequestShell {
+        mode: ShellMode::Interactive,
+        program,
+        args,
+    };
+    if let Err(e) = write_frame(&mut stream, &req).await {
+        let _ = burrow.kill().await;
+        panic!("write_frame(RequestShell): {e}");
+    }
+    let resp: ServerResp = match timeout(Duration::from_secs(15), read_frame(&mut stream)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let _ = burrow.kill().await;
+            panic!("read_frame(ShellReady): {e}");
+        }
+        Err(_) => {
+            let _ = burrow.kill().await;
+            panic!("timeout waiting for ShellReady");
+        }
+    };
+    match resp {
+        ServerResp::ShellReady => {}
+        other => {
+            let _ = burrow.kill().await;
+            panic!("expected ShellReady, got {other:?}");
+        }
+    }
+
+    // Initial PTY size — mirrors `run_shell_interactive` in
+    // src/bin/burrow-client.rs. 80x24 is the conservative default.
+    if let Err(e) = sp::write_resize(&mut stream, 80, 24).await {
+        let _ = burrow.kill().await;
+        panic!("write_resize: {e}");
+    }
+
+    // Chained commands. Three separate STDIN frames to simulate a
+    // user typing each at the prompt. Line endings are CRLF because
+    // that's what a terminal sends on Enter; cmd.exe and /bin/sh both
+    // tolerate both.
+    let commands: [&[u8]; 3] = [b"echo one\r\n", b"echo two\r\n", b"exit\r\n"];
+
+    // Split the duplex so one task can write while the main task
+    // reads. Writes go through an mpsc channel so the reader can
+    // also emit DSR responses (Windows ConPTY queries cursor
+    // position with `\x1b[6n` on startup and hangs if not answered).
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(bytes) = stdin_rx.recv().await {
+            if sp::write_stdin(&mut writer, &bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Producer task: types the commands after a brief settle so the
+    // shell prompt has rendered.
+    let stdin_for_cmds = stdin_tx.clone();
+    let cmd_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for cmd in commands {
+            if stdin_for_cmds.send(cmd.to_vec()).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+
+    // Drain STDOUT frames until we see EXIT (or the stream closes).
+    // On the way, scan each chunk for `\x1b[6n` (cursor position
+    // query) and send back a canned `\x1b[24;80R` so ConPTY's
+    // terminal-cap probe doesn't block.
+    let mut accumulated = Vec::<u8>::new();
+    let mut exit_code: Option<i32> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut scratch = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, sp::read_frame(&mut reader, &mut scratch)).await {
+            Ok(Ok(sp::Frame::Stdout(data))) => {
+                // Respond to cursor-position DSR queries before
+                // appending (so we don't accidentally match a later
+                // literal `[6n` in command output).
+                if data.windows(4).any(|w| w == b"\x1b[6n") {
+                    let _ = stdin_tx.send(b"\x1b[24;80R".to_vec());
+                }
+                accumulated.extend_from_slice(data);
+            }
+            Ok(Ok(sp::Frame::Exit(code))) => {
+                exit_code = Some(code);
+                break;
+            }
+            Ok(Ok(_other)) => {} // Unknown/Stdin/Resize/StdinEof — ignore
+            Ok(Err(e)) => {
+                eprintln!("read_frame error (likely clean close): {e}");
+                break;
+            }
+            Err(_) => {
+                eprintln!(
+                    "read timed out; accumulated bytes so far = {}",
+                    accumulated.len()
+                );
+                break;
+            }
+        }
+    }
+    cmd_task.abort();
+    drop(stdin_tx);
+    let _ = writer_task.await;
+
+    let text = String::from_utf8_lossy(&accumulated);
+    eprintln!(
+        "=== interactive shell STDOUT ({} bytes) ===",
+        accumulated.len()
+    );
+    eprintln!("{text}");
+    eprintln!("=== end; exit_code = {exit_code:?} ===");
+
+    assert!(
+        text.contains("one"),
+        "expected first chained command's output 'one' in STDOUT, got {} bytes",
+        accumulated.len()
+    );
+    assert!(
+        text.contains("two"),
+        "expected second chained command's output 'two' in STDOUT, got {} bytes",
+        accumulated.len()
+    );
+    assert!(
+        exit_code.is_some(),
+        "expected EXIT frame after `exit\\r\\n`, did not receive one"
     );
 
     let _ = burrow.kill().await;
