@@ -63,6 +63,12 @@ dashmap           = { version = "6", optional = true }
 # independent of which transitive dep's re-export we happen to use.
 bytes             = { version = "1", optional = true }
 url               = { version = "2", optional = true }
+# Used at module boundaries that surface `ts_control::TailnetAddress`
+# (whose `ipv4`/`ipv6` fields are `ipnet::Ipv{4,6}Net`). Vendored
+# tailscale-rs transitively depends on ipnet already; declaring it
+# directly lets our unit tests construct `Ipv4Net` without going via a
+# string parse.
+ipnet             = { version = "2", optional = true }
 
 [[bin]]
 name = "burrow"
@@ -105,6 +111,7 @@ headscale = [
     "dep:dashmap",
     "dep:bytes",
     "dep:url",
+    "dep:ipnet",
 ]
 
 # Test-only toggle that forwards `ts_transport_derp`'s `insecure-for-tests`
@@ -114,6 +121,10 @@ headscale = [
 headscale-insecure-tests = [
     "headscale",
     "ts_transport_derp?/insecure-for-tests",
+    # Allow ts_control to fetch the control server key over plain HTTP
+    # (Headscale configured without TLS for local tests — valid certs
+    # aren't in scope for a loopback tunnel).
+    "ts_control?/insecure-keyfetch",
 ]
 
 [target.'cfg(windows)'.dependencies]

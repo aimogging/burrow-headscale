@@ -254,6 +254,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hickory-proto",
+ "ipnet",
  "portable-pty-psmux",
  "serde",
  "smoltcp",
