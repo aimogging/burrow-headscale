@@ -18,6 +18,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 tracing.workspace = true
 url.workspace = true
 webpki-roots = { version = "1.0" }
+# burrow-headscale: PEM parsing for BURROW_EXTRA_CA_BUNDLE. Pulls in
+# no extra runtime weight; rustls already depends on pki-types.
+rustls-pemfile = "2"
 
 [features]
 # enable the connect_insecure function, which doesn't validate tls certs
