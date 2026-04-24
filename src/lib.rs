@@ -18,3 +18,10 @@ pub mod udp_proxy;
 pub mod udp_reverse;
 pub mod wire;
 pub mod yamux_bridge;
+
+#[cfg(feature = "headscale")]
+pub mod derp;
+#[cfg(feature = "headscale")]
+pub mod headscale;
+#[cfg(feature = "headscale")]
+pub mod peer_table;

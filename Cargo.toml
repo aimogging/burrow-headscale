@@ -39,6 +39,17 @@ portable-pty = { package = "portable-pty-psmux", version = "0.9" }
 # Client-side raw terminal + window-resize events.
 crossterm = "0.28"
 
+# --- Headscale fork (Stage 0 scaffolding; gated behind `headscale` feature) ---
+# The upstream layout keeps crates at the workspace root, not in a `crates/`
+# subdir, so paths are `vendor/tailscale-rs/ts_*` rather than
+# `vendor/tailscale-rs/crates/ts_*` as the original plan assumed.
+# See `vendor/tailscale-rs/REVISION` for the pinned commit.
+ts_control        = { path = "vendor/tailscale-rs/ts_control", optional = true }
+ts_control_noise  = { path = "vendor/tailscale-rs/ts_control_noise", optional = true }
+ts_control_serde  = { path = "vendor/tailscale-rs/ts_control_serde", optional = true }
+ts_transport_derp = { path = "vendor/tailscale-rs/ts_transport_derp", optional = true }
+ts_keys           = { path = "vendor/tailscale-rs/ts_keys", optional = true }
+
 [[bin]]
 name = "burrow"
 path = "src/main.rs"
@@ -65,6 +76,18 @@ embedded-config = []
 # binary that emits nothing on stdout/stderr. Debug builds still log
 # normally so `cargo test` output stays useful.
 silent = ["tracing/release_max_level_off"]
+
+# Experimental Stage 0 scaffolding for the Headscale fork. Pulls in the
+# vendored tailscale-rs crates under `vendor/tailscale-rs/` as path deps
+# and activates the `headscale`/`derp`/`peer_table` stub modules. Default
+# build (no features) remains the stock wg-quick gateway.
+headscale = [
+    "dep:ts_control",
+    "dep:ts_control_noise",
+    "dep:ts_control_serde",
+    "dep:ts_transport_derp",
+    "dep:ts_keys",
+]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }
