@@ -35,7 +35,10 @@ use burrow::wire::{
 use burrow::yamux_bridge::{drive_connection, udp_frame};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "burrow companion CLI: tunnels, shell, keygen, config gen")]
+#[command(
+    version,
+    about = "burrow companion CLI: tunnels, shell, keygen, config gen"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -66,6 +69,23 @@ enum Cmd {
     /// Generate a ready-to-use trio of configs: server.conf, burrow.conf,
     /// clientN.conf.
     Gen(GenArgs),
+    /// Register this client as a tailnet node against a Headscale server.
+    /// Prints the tailnet IPv4 that Headscale assigns, then exits.
+    ///
+    /// Each invocation creates a fresh ephemeral node key (nothing
+    /// persists to disk). Longer-lived client workflows will arrive with
+    /// the `attach` subcommand once tunnel/shell are ported to ride the
+    /// DERP transport.
+    Login {
+        #[arg(long, env = "BURROW_HEADSCALE_URL")]
+        server_url: String,
+        #[arg(long, env = "BURROW_HEADSCALE_AUTHKEY")]
+        authkey: String,
+        /// Hostname to advertise to Headscale. Defaults to the OS
+        /// hostname via `gethostname` (applied inside `ts_control`).
+        #[arg(long, env = "BURROW_HEADSCALE_HOSTNAME")]
+        hostname: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -166,17 +186,67 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
-        Cmd::Tunnel { burrow_ip, control_port, action } => {
+        Cmd::Tunnel {
+            burrow_ip,
+            control_port,
+            action,
+        } => {
             let addr = SocketAddrV4::new(burrow_ip, control_port);
             run_tunnel(addr, action).await
         }
-        Cmd::Shell { burrow_ip, control_port, args } => {
+        Cmd::Shell {
+            burrow_ip,
+            control_port,
+            args,
+        } => {
             let addr = SocketAddrV4::new(burrow_ip, control_port);
             run_shell(addr, args).await
         }
         Cmd::Keygen => keygen(),
         Cmd::Gen(args) => gen_configs(args),
+        Cmd::Login {
+            server_url,
+            authkey,
+            hostname,
+        } => run_login(server_url, authkey, hostname).await,
     }
+}
+
+async fn run_login(
+    server_url: String,
+    authkey: String,
+    hostname: Option<String>,
+) -> Result<ExitCode> {
+    use burrow::headscale::HeadscaleClient;
+    use burrow::node_identity::NodeIdentity;
+    use std::time::Duration;
+
+    let url = url::Url::parse(&server_url)
+        .with_context(|| format!("parsing --server-url {server_url}"))?;
+    let ident = NodeIdentity::generate();
+    let client = HeadscaleClient::connect(url, &ident, &authkey, hostname)
+        .await
+        .context("HeadscaleClient::connect")?;
+
+    // Wait up to 10s for the initial netmap delta that carries our
+    // tailnet IP. Matches hs_main's startup gate.
+    let mut rx = client.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let tailnet_ip = loop {
+        if let Some(ip) = client.snapshot().my_tailnet_ipv4 {
+            break ip;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("timed out waiting for Headscale to assign a tailnet IP");
+        }
+        tokio::time::timeout(deadline - now, rx.changed())
+            .await
+            .context("netmap stream produced no state change inside 10s")?
+            .context("netmap watch channel closed")?;
+    };
+    println!("{tailnet_ip}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn keygen() -> Result<ExitCode> {
@@ -191,8 +261,9 @@ fn keygen() -> Result<ExitCode> {
 fn gen_configs(args: GenArgs) -> Result<ExitCode> {
     // clap's value_delimiter on a String with default_value = "" yields
     // vec![""] rather than empty — filter blanks here.
-    let filter_blank =
-        |v: Vec<String>| -> Vec<String> { v.into_iter().filter(|s| !s.trim().is_empty()).collect() };
+    let filter_blank = |v: Vec<String>| -> Vec<String> {
+        v.into_iter().filter(|s| !s.trim().is_empty()).collect()
+    };
     let routes = filter_blank(args.routes);
     let dns = filter_blank(args.dns);
     let subnet = parse_ipv4_cidr(&args.subnet)
@@ -217,7 +288,11 @@ fn gen_configs(args: GenArgs) -> Result<ExitCode> {
         set_private_file_permissions(&path);
     }
 
-    println!("wrote {} config(s) to {}:", configs.len(), args.out.display());
+    println!(
+        "wrote {} config(s) to {}:",
+        configs.len(),
+        args.out.display()
+    );
     for c in &configs {
         println!("  {}", c.filename);
     }
@@ -287,7 +362,10 @@ async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
                     if entries.is_empty() {
                         println!("(no active tunnels)");
                     } else {
-                        println!("{:<10} {:<5} {:<10} {}", "TUNNEL", "PROTO", "LISTEN", "FORWARD");
+                        println!(
+                            "{:<10} {:<5} {:<10} {}",
+                            "TUNNEL", "PROTO", "LISTEN", "FORWARD"
+                        );
                         for e in entries {
                             let proto = match e.proto {
                                 Proto::Tcp => "TCP",
@@ -350,9 +428,8 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
                 }
                 Some(path) => {
                     let p = PathBuf::from(path);
-                    std::fs::write(&p, &stdout).with_context(|| {
-                        format!("writing stdout to {}", p.display())
-                    })?;
+                    std::fs::write(&p, &stdout)
+                        .with_context(|| format!("writing stdout to {}", p.display()))?;
                     // stderr still goes to local stderr so the caller
                     // knows something went wrong.
                     use std::io::Write;
@@ -424,11 +501,7 @@ async fn run_tunnel_start(
     };
     eprintln!(
         "tunnel {} started ({:?} {}:{} -> {}). press ctrl-c to stop.",
-        tunnel_id.0,
-        proto,
-        bind_label,
-        listen_port,
-        forward_to
+        tunnel_id.0, proto, bind_label, listen_port, forward_to
     );
 
     // Upgrade the control flow to a yamux client. Server opens outbound
@@ -527,8 +600,7 @@ async fn run_udp_substream(
 
     // Single writer task for the substream — per-peer reply tasks send
     // frames through this channel so writes are serialized.
-    let (frame_tx, mut frame_rx) =
-        mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
     let writer = tokio::spawn(async move {
         let mut y_w = y_w;
         while let Some((ip, port, data)) = frame_rx.recv().await {
@@ -709,7 +781,9 @@ fn configure_windows_console() -> (Option<u32>, Option<u32>) {
 
 #[cfg(windows)]
 fn restore_windows_console(prev_stdin: Option<u32>, prev_stdout: Option<u32>) {
-    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     unsafe {
         if let Some(m) = prev_stdin {
             let h = GetStdHandle(STD_INPUT_HANDLE);
@@ -900,12 +974,7 @@ async fn run_shell_interactive(
 fn parse_r_spec(spec: &str) -> Result<(BindAddr, u16, String)> {
     let parts: Vec<&str> = spec.splitn(4, ':').collect();
     let (bind, listen_str, host, port_str) = match parts.len() {
-        3 => (
-            BindAddr::Default,
-            parts[0],
-            parts[1].to_string(),
-            parts[2],
-        ),
+        3 => (BindAddr::Default, parts[0], parts[1].to_string(), parts[2]),
         4 => {
             let bind_ip: Ipv4Addr = parts[0].parse().with_context(|| {
                 format!(
