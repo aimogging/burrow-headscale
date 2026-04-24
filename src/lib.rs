@@ -24,4 +24,6 @@ pub mod derp;
 #[cfg(feature = "headscale")]
 pub mod headscale;
 #[cfg(feature = "headscale")]
+pub mod node_identity;
+#[cfg(feature = "headscale")]
 pub mod peer_table;
