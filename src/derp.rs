@@ -29,6 +29,7 @@ use ts_keys::{NodeKeyPair, NodePublicKey};
 use ts_packet::PacketMut;
 use ts_transport_derp::{frame::SendPacket, DefaultClient, ServerConnInfo};
 
+#[derive(Debug)]
 pub struct DerpInbound {
     pub sender: NodePublicKey,
     pub bytes: Bytes,

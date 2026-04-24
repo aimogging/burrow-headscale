@@ -107,6 +107,15 @@ headscale = [
     "dep:url",
 ]
 
+# Test-only toggle that forwards `ts_transport_derp`'s `insecure-for-tests`
+# through to our build, letting the real-DERP round-trip integration test
+# (`tests/derp_real_roundtrip.rs`) connect to a local Headscale container
+# with a self-signed cert or no cert at all. Not for production builds.
+headscale-insecure-tests = [
+    "headscale",
+    "ts_transport_derp?/insecure-for-tests",
+]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }
 
