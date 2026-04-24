@@ -85,6 +85,23 @@ path = "src/bin/burrow-client.rs"
 #                  --features embedded-config`
 embedded-config = []
 
+# Bake Headscale credentials (server URL + preauth key + optional hostname)
+# at $BURROW_HEADSCALE_EMBED into the binary as `&'static str` constants.
+# With this feature the gateway runs with no flags required — `burrow`
+# registers against the embedded Headscale URL on startup. Same secrets
+# caveat as `embedded-config`: anyone with read access to the binary can
+# extract the authkey via `strings`, so treat the compiled binary with
+# the same care as the preauth key itself.
+#
+# Build with:
+#   BURROW_HEADSCALE_EMBED=./burrow-headscale.txt cargo build --release \
+#       --features embedded-headscale-config
+#
+# Generate the embed file via: `burrow-client headscale-embed \
+#     --server-url <url> --authkey <key> [--hostname <name>] \
+#     --out ./burrow-headscale.txt`
+embedded-headscale-config = []
+
 # Compile out all `tracing` events at any level in release builds (via
 # tracing's `release_max_level_off` feature) and gate out the panic-hook's
 # stderr printing. Pairs naturally with `embedded-config` for a deploy

@@ -100,6 +100,56 @@ gen-embed *GEN_ARGS:
 gen *ARGS:
     cargo run --release --bin burrow-client -- gen {{ARGS}}
 
+# Min-sized silent burrow with Headscale credentials embedded. Same
+# path-remap + secrets caveat as `embed`.
+[unix]
+headscale-embed EMBED TARGET=target:
+    #!/usr/bin/env bash
+    set -eu
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+    repo="$(pwd)"
+    registry_src="$(find "$cargo_home/registry/src" -maxdepth 1 -type d -name 'index.crates.io-*' 2>/dev/null | head -1)"
+    remap="--remap-path-prefix=$repo=src --remap-path-prefix=$cargo_home=cargo --remap-path-prefix=$rustup_home=rustup"
+    if [ -n "$registry_src" ]; then
+        remap="$remap --remap-path-prefix=$registry_src=deps"
+    fi
+    target_flag=""
+    if [ -n "{{TARGET}}" ]; then
+        target_flag="--target {{TARGET}}"
+    fi
+    BURROW_HEADSCALE_EMBED="$(realpath '{{EMBED}}')" RUSTFLAGS="$remap" \
+        cargo build --bin burrow --profile min \
+        --features embedded-headscale-config,silent $target_flag
+    RUSTFLAGS="$remap" \
+        cargo build --bin burrow-client --profile min --features silent $target_flag
+
+# Min-sized silent burrow with Headscale credentials embedded. Same
+# path-remap + secrets caveat as `embed`.
+[windows]
+headscale-embed EMBED TARGET=target:
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
+    $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
+    $repo = (Get-Location).Path; \
+    $registrySrc = (Get-ChildItem "$cargoHome\registry\src" -Directory -Filter 'index.crates.io-*' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; \
+    $remap = "--remap-path-prefix=$repo=src --remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$rustupHome=rustup"; \
+    if ($registrySrc) { $remap = "$remap --remap-path-prefix=$registrySrc=deps" }; \
+    $env:RUSTFLAGS = $remap; \
+    $env:BURROW_HEADSCALE_EMBED = (Resolve-Path '{{EMBED}}').Path; \
+    $t = if ('{{TARGET}}' -eq '') { @() } else { @('--target','{{TARGET}}') }; \
+    cargo build --bin burrow --profile min --features embedded-headscale-config,silent @t; \
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
+    cargo build --bin burrow-client --profile min --features silent @t
+
+# One-shot: generate the headscale embed file AND build min-sized
+# binaries. Forwards HEADSCALE_ARGS to `burrow-client headscale-embed`
+# (e.g. `just headscale-gen-embed --server-url https://hs.example \
+# --authkey xxx`). The embed file lands at ./burrow-headscale.txt and
+# ships into `burrow` via `embedded-headscale-config`.
+headscale-gen-embed *HEADSCALE_ARGS:
+    cargo run --release --bin burrow-client -- headscale-embed {{HEADSCALE_ARGS}} --out ./burrow-headscale.txt
+    @just headscale-embed ./burrow-headscale.txt {{target}}
+
 # Run the debug burrow binary with args passed through.
 run *ARGS:
     cargo run --bin burrow -- {{ARGS}}

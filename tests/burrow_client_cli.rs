@@ -112,7 +112,13 @@ async fn tunnel_start_tcp_writes_correct_request() {
     assert!(status.success(), "exit status: {status:?}");
     // Startup banner goes to stderr; no stdout for this subcommand.
     let mut stderr = Vec::new();
-    child.stderr.as_mut().unwrap().read_to_end(&mut stderr).await.ok();
+    child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .await
+        .ok();
     let stderr = String::from_utf8_lossy(&stderr);
     assert!(
         stderr.contains("tunnel 42 started"),
@@ -287,4 +293,110 @@ async fn shell_detach_prints_pid() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.trim(), "1234");
+}
+
+#[tokio::test]
+async fn headscale_embed_writes_newline_separated_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("burrow-headscale.txt");
+
+    let out = tokio::task::spawn_blocking({
+        let client_path = burrow_client_path().to_string();
+        let out_path = out_path.clone();
+        move || {
+            Command::new(&client_path)
+                .args([
+                    "headscale-embed",
+                    "--server-url",
+                    "https://hs.example",
+                    "--authkey",
+                    "auth-abc-123",
+                    "--hostname",
+                    "test-node",
+                    "--out",
+                ])
+                .arg(&out_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "headscale-embed failed: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = std::fs::read_to_string(&out_path).expect("embed file readable");
+    assert_eq!(body, "https://hs.example\nauth-abc-123\ntest-node\n");
+}
+
+#[tokio::test]
+async fn headscale_embed_omits_hostname_line_when_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("burrow-headscale.txt");
+
+    let out = tokio::task::spawn_blocking({
+        let client_path = burrow_client_path().to_string();
+        let out_path = out_path.clone();
+        move || {
+            Command::new(&client_path)
+                .args([
+                    "headscale-embed",
+                    "--server-url",
+                    "https://hs.example",
+                    "--authkey",
+                    "auth-abc-123",
+                    "--out",
+                ])
+                .arg(&out_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(out.status.success());
+    let body = std::fs::read_to_string(&out_path).expect("embed file readable");
+    assert_eq!(body, "https://hs.example\nauth-abc-123\n");
+}
+
+#[tokio::test]
+async fn headscale_embed_rejects_bad_url() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("burrow-headscale.txt");
+
+    let out = tokio::task::spawn_blocking({
+        let client_path = burrow_client_path().to_string();
+        let out_path = out_path.clone();
+        move || {
+            Command::new(&client_path)
+                .args([
+                    "headscale-embed",
+                    "--server-url",
+                    "not-a-url",
+                    "--authkey",
+                    "auth",
+                    "--out",
+                ])
+                .arg(&out_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(!out.status.success(), "embed must fail for invalid URL");
+    // Output file must not have been created.
+    assert!(!out_path.exists());
 }

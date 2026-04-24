@@ -137,6 +137,29 @@ enum Cmd {
         #[arg(long, env = "BURROW_HEADSCALE_HOSTNAME")]
         hostname: Option<String>,
     },
+    /// Write a Headscale embed file (server URL + authkey + optional
+    /// hostname, newline-separated) that `burrow` picks up when built
+    /// with `--features embedded-headscale-config` via the
+    /// `BURROW_HEADSCALE_EMBED` env var. Example usage:
+    ///
+    ///   burrow-client headscale-embed \
+    ///       --server-url https://hs.example --authkey <key> \
+    ///       --out ./burrow-headscale.txt
+    ///   BURROW_HEADSCALE_EMBED=./burrow-headscale.txt cargo build \
+    ///       --release --features embedded-headscale-config
+    HeadscaleEmbed {
+        #[arg(long, env = "BURROW_HEADSCALE_URL")]
+        server_url: String,
+        #[arg(long, env = "BURROW_HEADSCALE_AUTHKEY")]
+        authkey: String,
+        /// Optional hostname to advertise to Headscale. Omit to let
+        /// `ts_control` default to the OS hostname at runtime.
+        #[arg(long, env = "BURROW_HEADSCALE_HOSTNAME")]
+        hostname: Option<String>,
+        /// Output file path. Existing file is overwritten.
+        #[arg(long, default_value = "./burrow-headscale.txt")]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -273,6 +296,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             authkey,
             hostname,
         } => run_login(server_url, authkey, hostname).await,
+        Cmd::HeadscaleEmbed {
+            server_url,
+            authkey,
+            hostname,
+            out,
+        } => run_headscale_embed(server_url, authkey, hostname, out),
     }
 }
 
@@ -353,6 +382,64 @@ async fn run_login(
             .context("netmap watch channel closed")?;
     };
     println!("{tailnet_ip}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_headscale_embed(
+    server_url: String,
+    authkey: String,
+    hostname: Option<String>,
+    out: PathBuf,
+) -> Result<ExitCode> {
+    // Sanity-check the URL early so a typo gets a clear error here
+    // instead of at build time (where the failure appears inside a
+    // `cargo:rerun` step and is easy to misread).
+    let _ = url::Url::parse(&server_url)
+        .with_context(|| format!("parsing --server-url {server_url}"))?;
+
+    // Reject newlines and empty values that would confuse build.rs's
+    // line-at-a-time parser.
+    if server_url.is_empty() || authkey.is_empty() {
+        bail!("--server-url and --authkey must be non-empty");
+    }
+    for (name, val) in [("server-url", &server_url), ("authkey", &authkey)] {
+        if val.contains('\n') || val.contains('\r') {
+            bail!("--{name} must not contain newlines");
+        }
+    }
+    if let Some(h) = &hostname {
+        if h.contains('\n') || h.contains('\r') {
+            bail!("--hostname must not contain newlines");
+        }
+    }
+
+    let mut body = String::new();
+    body.push_str(&server_url);
+    body.push('\n');
+    body.push_str(&authkey);
+    body.push('\n');
+    if let Some(h) = &hostname {
+        body.push_str(h);
+        body.push('\n');
+    }
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dir of {}", out.display()))?;
+        }
+    }
+    std::fs::write(&out, body).with_context(|| format!("writing {}", out.display()))?;
+    set_private_file_permissions(&out);
+
+    println!("wrote {}", out.display());
+    println!();
+    println!("next:");
+    println!(
+        "  BURROW_HEADSCALE_EMBED={} cargo build --release \\",
+        out.display()
+    );
+    println!("      --features embedded-headscale-config,silent --bin burrow");
     Ok(ExitCode::SUCCESS)
 }
 

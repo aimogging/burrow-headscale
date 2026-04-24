@@ -44,6 +44,35 @@ const EMBEDDED_CONFIG: Option<&str> = {
     }
 };
 
+/// Headscale credentials baked in at build time via the
+/// `embedded-headscale-config` feature. When set, CLI args
+/// `--server-url`/`--authkey`/`--hostname` are optional; the binary
+/// registers with the embedded URL on startup. `build.rs` reads
+/// `$BURROW_HEADSCALE_EMBED` (a two- or three-line file) and emits
+/// `$OUT_DIR/embedded_headscale.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadscaleEmbed {
+    pub server_url: &'static str,
+    pub authkey: &'static str,
+    pub hostname: Option<&'static str>,
+}
+
+#[cfg(feature = "embedded-headscale-config")]
+mod embedded_headscale {
+    include!(concat!(env!("OUT_DIR"), "/embedded_headscale.rs"));
+}
+
+const EMBEDDED_HEADSCALE: Option<HeadscaleEmbed> = {
+    #[cfg(feature = "embedded-headscale-config")]
+    {
+        Some(embedded_headscale::EMBEDDED_HEADSCALE)
+    }
+    #[cfg(not(feature = "embedded-headscale-config"))]
+    {
+        None
+    }
+};
+
 /// The gateway binary is intentionally minimal: just the runtime. All
 /// utility commands (keygen, gen) live in `burrow-client` so they
 /// don't bloat the deploy binary.
@@ -93,18 +122,37 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(server_url) = cli.server_url.as_deref() {
+    // Resolve Headscale mode: explicit CLI takes priority; otherwise
+    // fall back to the build-time embed. Mixed sources (CLI URL + embed
+    // authkey, etc.) are allowed so an operator can rotate one field
+    // without rebuilding the binary.
+    let server_url = cli
+        .server_url
+        .clone()
+        .or_else(|| EMBEDDED_HEADSCALE.map(|e| e.server_url.to_owned()));
+    if let Some(server_url) = server_url {
         use burrow::hs_main::{self, HeadscaleArgs};
-        let url = url::Url::parse(server_url)
-            .with_context(|| format!("parsing --server-url {server_url}"))?;
+        let url = url::Url::parse(&server_url)
+            .with_context(|| format!("parsing server URL {server_url}"))?;
         let authkey = cli
             .authkey
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("--server-url requires --authkey"))?;
+            .or_else(|| EMBEDDED_HEADSCALE.map(|e| e.authkey.to_owned()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Headscale mode needs an authkey (via --authkey, \
+                     $BURROW_HEADSCALE_AUTHKEY, or `embedded-headscale-config`)"
+                )
+            })?;
+        let hostname = cli.hostname.clone().or_else(|| {
+            EMBEDDED_HEADSCALE
+                .and_then(|e| e.hostname)
+                .map(str::to_owned)
+        });
         return hs_main::run(HeadscaleArgs {
             server_url: url,
             authkey,
-            hostname: cli.hostname.clone(),
+            hostname,
         })
         .await;
     }
