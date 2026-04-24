@@ -1,27 +1,27 @@
 //! Stage 1e — real-DERP transport validation.
 //!
 //! Runs the same shape of handshake round-trip as
-//! `tests/derp_stub_roundtrip.rs`, but against an actual Headscale DERP
-//! server (via a self-signed cert, so the `insecure-for-tests` feature
-//! in `ts_transport_derp` bypasses cert validation).
+//! `tests/derp_stub_roundtrip.rs`, but against an actual DERP server
+//! with the `insecure-for-tests` feature in `ts_transport_derp`
+//! bypassing TLS cert validation.
 //!
-//! The Stage 1d/3e in-memory stub already covers the correctness of our
-//! own code (Peer + PeerTable + WgCore::from_raw composition). This
-//! test covers the transport layer that lives entirely in the vendored
-//! crate: TLS handshake, HTTP upgrade, WebSocket framing, control-frame
-//! handling (KeepAlive/Ping/Pong), `SendPacket`/`RecvPacket` routing
-//! keyed by node public key.
+//! **Caveat — bare derper only.** Headscale's embedded DERP validates
+//! incoming node keys against its registered-nodes table and closes
+//! the connection for unknown keys (`stream ended before server info`
+//! error). These tests create fresh `NodeKeyPair`s without registering
+//! them with any control server, so they only pass against a bare
+//! derper (`tailscale/derper` image, or an unregistered local derper).
+//! Against Headscale's embedded DERP they fail; use the real-transport
+//! round-trip in `tests/burrow_client_headscale.rs` instead — that
+//! one registers keys with Headscale first, so the DERP handshake
+//! is accepted.
 //!
-//! Opt in at runtime via the `BURROW_TEST_DERP_URL` environment variable
-//! pointing at `https://<host>:<port>` of a reachable Headscale (or bare
-//! derper). Without that variable the test short-circuits, so the
-//! broader test suite stays hermetic on machines without the tunnel
-//! up.
+//! Gated by `#[ignore]` so `cargo test --features insecure-tests`
+//! skips it by default. To run explicitly:
 //!
-//! Typical local setup (see session notes):
-//!   ssh -fN -L 18443:localhost:8443 do
-//!   BURROW_TEST_DERP_URL=https://localhost:18443 \
-//!     cargo test --features insecure-tests --test derp_real_roundtrip
+//!   BURROW_TEST_DERP_URL=https://<bare-derper>:<port> \
+//!     cargo test --features insecure-tests --test derp_real_roundtrip \
+//!     -- --ignored
 
 #![cfg(feature = "insecure-tests")]
 
@@ -59,6 +59,7 @@ fn derp_url() -> Option<url::Url> {
 }
 
 #[tokio::test]
+#[ignore = "requires a bare derper — fails against Headscale's embedded DERP which validates keys"]
 async fn two_clients_round_trip_a_small_payload() {
     let Some(url) = derp_url() else {
         eprintln!("BURROW_TEST_DERP_URL not set; skipping");
@@ -110,6 +111,7 @@ async fn two_clients_round_trip_a_small_payload() {
 }
 
 #[tokio::test]
+#[ignore = "requires a bare derper — fails against Headscale's embedded DERP which validates keys"]
 async fn wireguard_handshake_init_round_trips_over_real_derp() {
     let Some(url) = derp_url() else {
         eprintln!("BURROW_TEST_DERP_URL not set; skipping");

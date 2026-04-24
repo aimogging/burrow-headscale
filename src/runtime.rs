@@ -398,13 +398,6 @@ fn run_smoltcp_thread(
                     send_evt(SmoltcpEvent::TcpConnected { key, id });
                 }
 
-                // CLOSE_WAIT means peer has FIN'd us. Half-close signal.
-                if matches!(new_state, tcp::State::CloseWait)
-                    && !matches!(prev, Some(tcp::State::CloseWait))
-                {
-                    send_evt(SmoltcpEvent::TcpFinFromPeer { key, id });
-                }
-
                 let went_back_to_listen =
                     matches!(prev, Some(tcp::State::SynReceived | tcp::State::SynSent))
                         && matches!(new_state, tcp::State::Listen);
@@ -423,6 +416,13 @@ fn run_smoltcp_thread(
                 }
             }
 
+            // Drain buffered inbound bytes FIRST so that any data
+            // delivered in the same poll cycle as a peer FIN reaches
+            // the consumer before the half-close signal below.
+            // Without this ordering, a `DerpTcpStream` (or any
+            // consumer that treats `TcpFinFromPeer` as EOF) would
+            // report 0 bytes read even though the payload is still
+            // sitting in smoltcp's RX buffer.
             if !is_aborting && tcp_sock.can_recv() {
                 let mut buf = vec![0u8; RECV_CHUNK];
                 if let Ok(n) = tcp_sock.recv_slice(&mut buf) {
@@ -431,6 +431,17 @@ fn run_smoltcp_thread(
                         send_evt(SmoltcpEvent::TcpData { key, id, data: buf });
                     }
                 }
+            }
+
+            // CLOSE_WAIT means peer has FIN'd us. Emit the half-close
+            // signal AFTER any same-cycle data drain above — consumers
+            // like `DerpTcpStream` treat this as "no more data coming"
+            // and we don't want to swallow a still-buffered payload.
+            if prev != Some(new_state)
+                && matches!(new_state, tcp::State::CloseWait)
+                && !matches!(prev, Some(tcp::State::CloseWait))
+            {
+                send_evt(SmoltcpEvent::TcpFinFromPeer { key, id });
             }
 
             if matches!(new_state, tcp::State::Closed) && !is_aborting {

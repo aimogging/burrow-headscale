@@ -206,6 +206,7 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_tracing();
     let cli = Cli::parse();
     match run(cli).await {
         Ok(code) => code,
@@ -214,6 +215,23 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Initialise a stderr-writing subscriber so tracing output from
+/// `ClientSession` / the vendored `ts_control` crates is visible when
+/// diagnosing a stuck session. Stderr (not stdout) so it doesn't
+/// collide with subcommands that print actual data to stdout (e.g.
+/// `login` printing a tailnet IP, `shell --output -` forwarding
+/// captured shell stdout).
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("warn,burrow=info,ts_control=warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {

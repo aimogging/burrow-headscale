@@ -42,6 +42,10 @@ pub fn spawn_reconciler(
             "reconciler applying initial snapshot"
         );
         peers.reconcile(&snap.peers, &ident, keepalive);
+        trace!(
+            peer_table_len = peers.len(),
+            "reconciler: initial snapshot applied"
+        );
 
         loop {
             if rx.changed().await.is_err() {

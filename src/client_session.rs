@@ -261,26 +261,42 @@ impl ClientSession {
         ))
     }
 
+    /// Poll `PeerTable` (populated by the reconciler) for a peer at
+    /// `dst`. Polling — not a watch-channel await — because PeerTable
+    /// updates are downstream of netmap updates + the reconciler task,
+    /// and there's a race where `watch::Receiver::changed()` returns
+    /// *before* the reconciler has finished processing the same
+    /// snapshot. A fixed-interval poll catches the peer once the
+    /// reconciler's insert lands in the DashMap, independent of the
+    /// netmap-to-reconciler ordering.
     async fn wait_for_peer(&self, dst: Ipv4Addr) -> Result<()> {
         let deadline = tokio::time::Instant::now() + PEER_WAIT_TIMEOUT;
-        let mut rx = self.headscale.subscribe();
-        loop {
+        let mut logged = false;
+        while tokio::time::Instant::now() < deadline {
             if self.peers.by_tailnet_ip(&dst).is_some() {
                 return Ok(());
             }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(anyhow!(
-                    "peer {dst} not present in Headscale netmap after {PEER_WAIT_TIMEOUT:?}"
-                ));
+            if !logged {
+                let snap = self.headscale.snapshot();
+                tracing::debug!(
+                    %dst,
+                    peer_table_len = self.peers.len(),
+                    netmap_peers = snap.peers.len(),
+                    netmap_ips = ?snap.peers.iter().map(|p| p.tailnet_ipv4).collect::<Vec<_>>(),
+                    "wait_for_peer: dst not yet in peer table, polling",
+                );
+                logged = true;
             }
-            tokio::time::timeout(deadline - now, rx.changed())
-                .await
-                .map_err(|_| {
-                    anyhow!("peer {dst} not present in netmap after {PEER_WAIT_TIMEOUT:?}")
-                })?
-                .map_err(|_| anyhow!("Headscale control-state watch closed"))?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let snap = self.headscale.snapshot();
+        let known: Vec<Ipv4Addr> = snap.peers.iter().map(|p| p.tailnet_ipv4).collect();
+        Err(anyhow!(
+            "peer {dst} not present in PeerTable after {PEER_WAIT_TIMEOUT:?} \
+             (peer_table_len={}, netmap_peers={:?})",
+            self.peers.len(),
+            known,
+        ))
     }
 }
 
