@@ -1,1 +1,3 @@
 /target
+# Transient artifact used once for sandbox→local transfer; see chat history.
+/headscale-fork.bundle
