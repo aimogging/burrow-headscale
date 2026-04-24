@@ -8,8 +8,8 @@ sockets for ICMP.
 - [Quick start](#quick-start)
 - [Examples](#examples)
 - [Commands](#commands)
+- [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
-- [Library API](#library-api)
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
@@ -269,60 +269,90 @@ for build / embed recipes.
    connections yamux-multiplex back to the owning client, which
    originates the `forward_to` connection locally.
 
-## Library API
+## Troubleshooting
 
-Anything `burrow-client` does over the tailnet is also exposed as a
-library — if you want to build your own tool that rides DERP without
-wrapping the `burrow-client` binary, use
-[`burrow::client_session::ClientSession`]. One `ClientSession` owns
-the Headscale registration + DERP connection + per-peer `boringtun`
-machinery; individual flows are short-lived handles on top.
+### `burrow` fails immediately with `invalid peer certificate: UnknownIssuer`
 
-```rust
-use std::time::Duration;
-use burrow::client_session::ClientSession;
-use url::Url;
+Your Headscale is serving HTTPS with a certificate that isn't in the
+system trust store (common for self-hosted Headscale with a private CA,
+or any `caddy`/`traefik` install with a non-public ACME issuer). Point
+burrow at the CA bundle and it'll validate normally:
 
-let session = ClientSession::connect(
-    Url::parse("https://headscale.example.com")?,
-    "hskey-auth-…",
-    Some("my-tool".into()),
-).await?;
-
-// Outbound TCP to a tailnet peer. Returns a tokio AsyncRead+AsyncWrite
-// (the DERP-backed DerpTcpStream) that acts like a real TcpStream.
-let mut stream = session.open_tcp("100.64.0.5".parse()?, 8080).await?;
-
-// One-shot UDP request / response (DNS-style).
-let answer = session.query_udp(
-    "100.64.0.5".parse()?,
-    53,
-    &dns_query_bytes,
-    Duration::from_secs(5),
-).await?;
-
-// Or long-lived UDP — bind_udp returns a drop-guarded receiver.
-let mut udp = session.bind_udp();
-session.send_udp(udp.port(), "100.64.0.5".parse()?, 1234, b"hi").await?;
-while let Some((src, port, payload)) = udp.recv().await { … }
+```sh
+export BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem
+burrow --server-url https://headscale.example.com --authkey hskey-auth-...
 ```
 
-`ClientSession` spawns background tasks (netmap reconciler, DERP
-supervisor, smoltcp runtime, WG timer tick, event dispatcher); they're
-all aborted when the session drops. Everything is `Send + Sync` so the
-session can be shared via `Arc` across tasks.
+One env var is inspected by both `burrow` and `burrow-client`. The
+file can contain multiple concatenated PEM certs — all of them are
+added as additional trust anchors on top of the system store.
 
-Gotchas worth knowing:
-- **Build-time:** if Headscale uses a self-signed cert, set
-  `BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem` before running. Otherwise
-  the TLS handshake fails with `UnknownIssuer`.
-- **First connect is slow** (~3 s) while the WG handshake completes —
-  smoltcp retries the SYN once boringtun has a session.
-- **PTY interactive shell:** burrow uses ConPTY on Windows / forkpty
-  on Unix. On Windows a headless driver must answer cursor-position
-  DSR queries (`\x1b[6n`) or the shell will hang; see
-  `tests/burrow_client_headscale.rs::interactive_shell_runs_chained_commands_via_real_derp`
-  for a worked example.
+### `burrow` registered but doesn't appear in `headscale nodes list`
+
+It's there, just listed as offline. Headscale marks ephemeral nodes
+offline the moment the netmap stream disconnects — if you ran burrow
+briefly and killed it, the entry either expired or shows offline
+until the expiry policy sweeps it. Check `--ephemeral` on your
+preauth key and `headscale nodes expire-policy` if stale entries
+pile up.
+
+### First connection is slow (~3–5 s), subsequent connections are fast
+
+Expected. On the first packet to a new peer, `boringtun` initiates a
+WireGuard handshake (one DERP round-trip), then smoltcp retries the
+dropped SYN after its retransmit timer (~3 s). Once the WG session
+is live, subsequent flows pay only the DERP + smoltcp RTT. If this
+bothers you, run `burrow-client login` on script startup to keep a
+session warm.
+
+### `burrow-client shell` hangs after printing the prompt banner
+
+Usually a PTY quirk. If you're driving `burrow-client shell`
+programmatically (piping through a headless automation harness on
+Windows), ConPTY's cursor-position query (`\x1b[6n`) needs a response
+or cmd.exe blocks forever. Either run in a real terminal, or write
+your driver to answer the DSR with something like `\x1b[24;80R`.
+
+Interactive shells run from a real terminal don't hit this — your
+terminal driver handles the query automatically.
+
+### `ping` through burrow works from Linux but not Windows
+
+ICMP raw sockets require `CAP_NET_RAW` on Linux and Administrator on
+Windows. Without them, burrow can't send real ICMP; `ping` to a peer
+behind burrow gets an `admin-prohibited` response instead of the echo
+reply. Run burrow as Administrator on Windows (or with
+`CAP_NET_RAW` on Linux) to enable ICMP forwarding.
+
+TCP and UDP are unaffected — they use plain sockets.
+
+### `burrow-client tunnel -R 443:…` — port already in use
+
+`burrow-client tunnel start` asks the burrow *gateway host* to bind
+the listener. If burrow's host already has something on port 443,
+the bind fails and you get a `StartError` response. Pick an
+unused port (`-R 8443:…`) or stop the conflicting service on the
+gateway first.
+
+### `FTP / SIP / H.323 / [...]` through burrow misbehaves
+
+Burrow is pure layer-3/4 NAT with no application-layer gateway.
+Protocols that embed their own IP/port inside the payload (active
+FTP, SIP, H.323, some game protocols) can't be rewritten by burrow
+and will misbehave. Workarounds: use passive-mode FTP, tunnel the
+protocol over SSH via a reverse tunnel, or pick a different
+protocol. Linux's `nf_conntrack_*` kernel helpers are the
+equivalent; burrow has no analog.
+
+### I want `burrow` to survive reboots
+
+It doesn't, by design — every `burrow` process generates a fresh
+node key. Use Headscale's `ephemeral=true` preauth keys (so stale
+registrations expire on disconnect) and run burrow under a process
+supervisor (`systemd`, `nssm` on Windows, etc.) that auto-restarts
+on crash. The headscale-assigned IP may change on each restart —
+reference burrow by its `headscale nodes list` name if you're
+scripting.
 
 ## Limitations
 
@@ -343,47 +373,17 @@ Gotchas worth knowing:
 ## Development
 
 ```sh
-cargo test                                # hermetic lib + integration tests (~130 cases)
+cargo test                                # hermetic lib + integration tests
 cargo test --features insecure-tests      # plus real-DERP / real-Headscale tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-The hermetic suite (91 lib + 33 integration) covers the full data
-plane under an in-memory DERP stub — smoltcp, NAT, reverse-tunnel
-protocol, shell handler, DNS resolver, CBOR framing. It's stable
-enough to run on any commit.
-
-Real-infra tests — gated on feature + env vars, short-circuit
-cleanly without them:
-
-| Test file | Env | Covers |
-|---|---|---|
-| `tests/headscale_register_roundtrip.rs` | `BURROW_TEST_HEADSCALE_{URL,AUTHKEY}` | Noise IK register + netmap |
-| `tests/burrow_client_headscale.rs` | same | 7 full E2E workflows (see below) |
-| `tests/derp_real_roundtrip.rs` | `BURROW_TEST_DERP_URL`, `#[ignore]` | bare-derper transport only |
-
-`burrow_client_headscale.rs` is the real-infra flagship — 13 cases
-(7 tokio E2E + 6 helper unit) in ~45 s wall time against a live
-Headscale. It exercises:
-
-- the CBOR control plane through `ClientSession::open_tcp`,
-- `burrow-client tunnel start -R` for TCP + UDP reverse tunnels,
-- `burrow-client shell --output -` one-shot mode,
-- `ClientSession::query_udp` against burrow's built-in DNS resolver,
-- multi-peer routing (one session, two burrows),
-- the framed-stdio interactive-shell protocol driven directly.
-
-For a self-signed Headscale, set
-`BURROW_EXTRA_CA_BUNDLE=/path/to/ca.pem`. Example against a local
-Headscale-in-Docker reached via SSH forward:
-
-```sh
-ssh -fN -L 18443:localhost:8443 your-headscale-host
-BURROW_TEST_HEADSCALE_URL=https://localhost:18443 \
-BURROW_TEST_HEADSCALE_AUTHKEY=hskey-auth-… \
-BURROW_EXTRA_CA_BUNDLE=/etc/headscale/ca.pem \
-    cargo test --features insecure-tests
-```
+The real-infra tests are gated on env vars
+(`BURROW_TEST_HEADSCALE_{URL,AUTHKEY}`, `BURROW_TEST_DERP_URL`) and
+short-circuit cleanly without them — the hermetic suite stays green
+without any external setup. See `tests/burrow_client_headscale.rs`
+for the test infrastructure pattern, and `CLAUDE.md` for design
+notes on the data plane.
 
 Vendored tailscale-rs sits under `vendor/tailscale-rs/`; pinned commit
 in `vendor/tailscale-rs/REVISION`. Don't let `cargo fmt --all` walk
